@@ -297,7 +297,11 @@ class Pdf2Zh {
         const path = join(this.config.skillDir, 'glossary.md')
         let text = ''
         try { text = await readFile(path, 'utf8') } catch { text = '' }
-        const terms = text.split('\n').filter((l) => /^[^#\s][^:]*:\s*\S/.test(l)).length
+        // A term line has an ASCII ':' whose key side is CJK-free (skips prose like "格式：…").
+        const terms = text.split('\n').filter((l) => {
+          const i = l.indexOf(':')
+          return i > 0 && !/[\u4e00-\u9fff`]/.test(l.slice(0, i))
+        }).length
         this.sendJson(res, 200, { ok: true, terms, text })
         return
       }
