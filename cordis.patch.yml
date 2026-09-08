@@ -1,0 +1,10 @@
+# dsh-pdf2zh bundle patch: inserts the plugin row into the profile roster.
+# Node half: syncs the pdf2zh skill into the DSH skill dir on boot and serves
+# the /api/pdf2zh/* routes (health / extract / translate / glossary / skill).
+# Browser half (exports "./client"): sidebar entry + center-column panel
+# (path input, options, extract preview, one-click session translation).
+- insert:
+    - id: pdf2zh
+      name: 'dsh-pdf2zh'
+      config:
+        apiPath: /api/pdf2zh
