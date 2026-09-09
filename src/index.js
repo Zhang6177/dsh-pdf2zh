@@ -10,8 +10,10 @@
  *       GET  /health    — plugin / python / pymupdf / skill status
  *       GET  /skill     — installed skill file listing
  *       GET  /glossary  — current glossary text
+ *       POST /glossary  — save edited glossary text
  *       POST /extract   — run the PyMuPDF extractor on a server-side PDF path
  *       POST /translate — open a fresh session and queue the pdf2zh skill prompt
+ *       POST /upload    — drag-drop PDF upload (raw body, filename in x-pdf2zh-filename)
  *
  * Translation itself is done by the session model driven by the skill; this
  * plugin only syncs the skill, extracts text, dispatches sessions, and
@@ -56,6 +58,7 @@ export const Config = z.object({
   python: z.string().default('python3').description('Python interpreter used by extract.py.'),
   skillSync: z.boolean().default(true).description('Sync bundled skill files into the DSH skill dir on boot.'),
   skillDir: z.string().description('Skill dir override; defaults to <DSH home>/skills/pdf2zh.'),
+  uploadDir: z.string().description('Drag-drop upload dir override; defaults to <DSH home>/pdf2zh/uploads.'),
 })
 
 class Pdf2Zh {
@@ -67,6 +70,7 @@ class Pdf2Zh {
       python: config.python ?? 'python3',
       skillSync: config.skillSync ?? true,
       skillDir: (config.skillDir || join(dshHome(), 'skills', 'pdf2zh')).replace(/\/+$/, ''),
+      uploadDir: (config.uploadDir || join(dshHome(), 'pdf2zh', 'uploads')).replace(/\/+$/, ''),
     }
     this.skill = { dir: this.config.skillDir, synced: false, files: [] }
     this.pymupdf = { checked: false, available: false, version: '' }
@@ -260,6 +264,73 @@ class Pdf2Zh {
     })
   }
 
+  /** Read a raw binary body (PDF upload) with its own, larger byte cap. */
+  readRawBody(req, maxBytes) {
+    return new Promise((resolvePromise, rejectPromise) => {
+      let size = 0
+      const chunks = []
+      let rejected = false
+      req.on('data', (chunk) => {
+        if (rejected) return
+        size += chunk.length
+        if (size > maxBytes) {
+          rejected = true
+          rejectPromise(new Error('file too large'))
+          req.destroy()
+          return
+        }
+        chunks.push(chunk)
+      })
+      req.on('end', () => {
+        if (rejected) return
+        resolvePromise(Buffer.concat(chunks))
+      })
+      req.on('error', (e) => {
+        if (!rejected) {
+          rejected = true
+          rejectPromise(e)
+        }
+      })
+    })
+  }
+
+  /** Reduce an uploaded filename to a safe basename (keeps CJK, drops path + control chars). */
+  sanitizeFilename(raw) {
+    let name = typeof raw === 'string' ? raw : ''
+    name = name.replace(/[\r\n\t]/g, ' ').trim()
+    name = name.split(/[\\/]/).pop() || ''
+    name = name.replace(/[^\w.\-\u4e00-\u9fff]+/g, '_').replace(/^_+|_+$/g, '')
+    return name
+  }
+
+  /** Store an uploaded PDF; de-duping existing names with -1, -2, … suffixes. */
+  async storeUpload(filename, buf) {
+    let name = this.sanitizeFilename(filename)
+    if (!/\.pdf$/i.test(name)) {
+      name = `${name.replace(/\.pdf$/i, '') || 'upload'}.pdf`
+    }
+    if (name === '.pdf' || name === '') name = `upload-${Date.now()}.pdf`
+    await mkdir(this.config.uploadDir, { recursive: true })
+    let target = join(this.config.uploadDir, name)
+    for (let i = 1; await stat(target).then(() => true, () => false); i += 1) {
+      target = join(this.config.uploadDir, name.replace(/\.pdf$/i, `-${i}.pdf`))
+    }
+    await writeFile(target, buf)
+    return target
+  }
+
+  /** Persist edited glossary text and return the recomputed term count. */
+  async saveGlossary(text) {
+    const path = join(this.config.skillDir, 'glossary.md')
+    await mkdir(this.config.skillDir, { recursive: true })
+    await writeFile(path, text, { mode: 0o644 })
+    const terms = text.split('\n').filter((l) => {
+      const i = l.indexOf(':')
+      return i > 0 && !/[\u4e00-\u9fff`]/.test(l.slice(0, i))
+    }).length
+    return { path, terms }
+  }
+
   sendJson(res, status, body) {
     const json = JSON.stringify(body)
     res.writeHead(status, {
@@ -286,6 +357,7 @@ class Pdf2Zh {
           python: this.config.python,
           pymupdf: this.pymupdf,
           skill: this.skill,
+          uploadDir: this.config.uploadDir,
         })
         return
       }
@@ -323,6 +395,22 @@ class Pdf2Zh {
           workspace: typeof body.workspace === 'string' && isAbsolute(body.workspace) ? body.workspace : undefined,
         })
         this.sendJson(res, 200, { ok: true, ...result })
+        return
+      }
+      if (req.method === 'POST' && sub === '/upload') {
+        const buf = await this.readRawBody(req, MAX_PDF_BYTES)
+        if (buf.length === 0) throw new Error('empty file')
+        let filename = (req.headers['x-pdf2zh-filename'] ?? '').toString()
+        try { filename = decodeURIComponent(filename) } catch { /* keep raw */ }
+        const path = await this.storeUpload(filename, buf)
+        this.sendJson(res, 200, { ok: true, path, filename: basename(path), bytes: buf.length })
+        return
+      }
+      if (req.method === 'POST' && sub === '/glossary') {
+        const body = await this.readBody(req)
+        if (typeof body.text !== 'string') throw new Error('text is required')
+        const saved = await this.saveGlossary(body.text)
+        this.sendJson(res, 200, { ok: true, path: saved.path, terms: saved.terms })
         return
       }
       this.sendJson(res, 404, { error: 'not found' })

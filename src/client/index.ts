@@ -77,6 +77,8 @@ const api = {
   translate: (body: { path: string; pages?: string; bilingual?: boolean; appendix?: boolean }): Promise<TranslateResult> =>
     call<TranslateResult>(`${API_PREFIX}/translate`, 'POST', body),
   glossary: (): Promise<Glossary> => call<Glossary>(`${API_PREFIX}/glossary`, 'GET'),
+  glossarySave: (text: string): Promise<{ ok: boolean; path: string; terms: number }> =>
+    call<{ ok: boolean; path: string; terms: number }>(`${API_PREFIX}/glossary`, 'POST', { text }),
 }
 
 /* ------------------------------------------------------------------ *\
@@ -132,8 +134,8 @@ function pushRecent(path: string): string[] {
 const INPUT_STYLE: React.CSSProperties = {
   boxSizing: 'border-box',
   width: '100%',
-  padding: '8px 10px',
-  fontSize: 13,
+  padding: '9px 12px',
+  fontSize: 14,
   borderRadius: 8,
   border: '1px solid var(--dsw-alias-border-l2)',
   background: 'var(--dsw-alias-bg-base)',
@@ -194,6 +196,13 @@ function Panel({ hide, openSession }: { hide: () => void; openSession?: (id: str
   const [session, setSession] = useState<TranslateResult | null>(null)
   const [error, setError] = useState('')
   const [glossary, setGlossary] = useState<Glossary | null>(null)
+  const [dragOver, setDragOver] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [uploadName, setUploadName] = useState('')
+  const [editingGlossary, setEditingGlossary] = useState(false)
+  const [glossaryDraft, setGlossaryDraft] = useState('')
+  const [savingGlossary, setSavingGlossary] = useState(false)
+  const fileRef = useRef<HTMLInputElement | null>(null)
   const healthTimer = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const refreshHealth = useCallback(() => {
@@ -217,6 +226,46 @@ function Panel({ hide, openSession }: { hide: () => void; openSession?: (id: str
   }, [hide, refreshHealth, refreshGlossary])
 
   const remember = useCallback((p: string): void => { setRecent(pushRecent(p)) }, [])
+
+  const uploadFile = useCallback(async (file: File): Promise<void> => {
+    if (!/\.pdf$/i.test(file.name)) { setError('仅支持 .pdf 文件'); return }
+    if (file.size > 100 * 1024 * 1024) { setError('PDF 不能超过 100 MB'); return }
+    setError('')
+    setUploading(true)
+    setUploadName(file.name)
+    try {
+      const resp = await fetch(`${API_PREFIX}/upload`, {
+        method: 'POST',
+        // HTTP headers must be ISO-8859-1; percent-encode CJK filenames (server decodes).
+        headers: { 'content-type': 'application/octet-stream', 'x-pdf2zh-filename': encodeURIComponent(file.name) },
+        body: file,
+      })
+      let data: any = null
+      try { data = await resp.json() } catch { /* non-JSON */ }
+      if (!resp.ok) throw new Error((data && data.error) || `HTTP ${resp.status}`)
+      setPath(data.path)
+      remember(data.path)
+    } catch (err: any) {
+      setError(err?.message ?? String(err))
+    } finally {
+      setUploading(false)
+      setDragOver(false)
+    }
+  }, [remember])
+
+  const onSaveGlossary = useCallback(async (): Promise<void> => {
+    setSavingGlossary(true)
+    setError('')
+    try {
+      await api.glossarySave(glossaryDraft)
+      setEditingGlossary(false)
+      refreshGlossary()
+    } catch (err: any) {
+      setError(err?.message ?? String(err))
+    } finally {
+      setSavingGlossary(false)
+    }
+  }, [glossaryDraft, refreshGlossary])
 
   const onExtract = useCallback(async (): Promise<void> => {
     if (!path.trim()) return
@@ -268,6 +317,7 @@ function Panel({ hide, openSession }: { hide: () => void; openSession?: (id: str
 
   return e('div', { className: 'pdf2zh-shell', role: 'region', 'aria-label': 'PDF 英转中' },
     e('header', { className: 'pdf2zh-top' },
+      e('div', { className: 'pdf2zh-top-inner' },
       e('div', { className: 'pdf2zh-heading' },
         e('span', { className: 'pdf2zh-logo' },
           e('svg', { viewBox: '0 0 24 24', fill: 'currentColor', 'aria-hidden': 'true' },
@@ -279,6 +329,7 @@ function Panel({ hide, openSession }: { hide: () => void; openSession?: (id: str
         ),
       ),
       e('button', { type: 'button', className: 'pdf2zh-back', onClick: hide }, '返回会话'),
+      ),
     ),
 
     e('main', { className: 'pdf2zh-scroll' },
@@ -291,7 +342,38 @@ function Panel({ hide, openSession }: { hide: () => void; openSession?: (id: str
           )),
         ),
 
-        Section({ title: '翻译论文', note: '服务器上的 PDF 绝对路径', children: [
+        Section({ title: '翻译论文', note: '填服务器上的 PDF 绝对路径，或直接拖拽/选择本地 PDF 上传', children: [
+          e('div', {
+            className: `pdf2zh-drop${dragOver ? ' pdf2zh-drop-hot' : ''}`,
+            onClick: () => { fileRef.current?.click() },
+            onDragOver: (ev: any) => { ev.preventDefault(); setDragOver(true) },
+            onDragLeave: () => setDragOver(false),
+            onDrop: (ev: any) => {
+              ev.preventDefault()
+              setDragOver(false)
+              const file = ev.dataTransfer?.files?.[0]
+              if (file) void uploadFile(file)
+            },
+          },
+            e('input', {
+              ref: fileRef,
+              type: 'file',
+              accept: '.pdf,application/pdf',
+              style: { display: 'none' },
+              onChange: (ev: any) => {
+                const file = ev.target?.files?.[0]
+                if (file) void uploadFile(file)
+                if (ev.target) ev.target.value = ''
+              },
+            }),
+            e('span', { className: 'pdf2zh-drop-icon' },
+              e('svg', { viewBox: '0 0 24 24', fill: 'currentColor', 'aria-hidden': 'true' },
+                e('path', { d: 'M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z' })),
+            ),
+            uploading
+              ? e('span', null, `正在上传 ${uploadName}…`)
+              : e('span', null, '拖拽 PDF 到此处，或点击选择文件上传到服务器'),
+          ),
           e('input', {
             className: 'pdf2zh-input',
             style: INPUT_STYLE,
@@ -313,11 +395,11 @@ function Panel({ hide, openSession }: { hide: () => void; openSession?: (id: str
           ) : null,
           e('div', { className: 'pdf2zh-options' },
             e('label', { className: 'pdf2zh-field' },
-              '页码',
+              '页码（默认全文）',
               e('input', {
-                style: { ...INPUT_STYLE, width: 110 },
+                style: { ...INPUT_STYLE, width: 130 },
                 value: pages,
-                placeholder: '1-8',
+                placeholder: '默认全文',
                 onChange: (ev: any) => setPages(ev.target.value),
               }),
             ),
@@ -382,19 +464,45 @@ function Panel({ hide, openSession }: { hide: () => void; openSession?: (id: str
           ] })
           : null,
 
-        Section({ title: '术语表', note: '跨论文译名一致', children: [
+        Section({ title: '术语表', note: '跨论文译名一致 · 可编辑', children: [
           glossary === null
             ? e('div', { className: 'pdf2zh-mut' }, '暂不可用')
-            : e('div', null,
-              glossaryLines.length > 0 ? e('div', { className: 'pdf2zh-glossary-sample' },
-                glossaryLines.map((l) => e('div', { key: l, className: 'pdf2zh-glossary-line' }, l)),
-                glossary.terms > glossaryLines.length ? e('div', { className: 'pdf2zh-mut' }, `… 共 ${glossary.terms} 条`) : null,
-              ) : e('div', { className: 'pdf2zh-mut' }, '（空）'),
-              e('details', { className: 'pdf2zh-preview' },
-                e('summary', null, `全文（${glossary.terms} 条）`),
-                e('pre', null, glossary.text),
-              ),
-            ),
+            : editingGlossary
+              ? e('div', { className: 'pdf2zh-glossary-edit' },
+                  e('textarea', {
+                    className: 'pdf2zh-glossary-textarea',
+                    value: glossaryDraft,
+                    spellCheck: false,
+                    onChange: (ev: any) => setGlossaryDraft(ev.target.value),
+                  }),
+                  e('div', { className: 'pdf2zh-mut' }, '格式：每行一条 `英文: 中文`（# 开头为注释）。保存后直接写回技能目录的 glossary.md。'),
+                  e('div', { className: 'pdf2zh-actions' },
+                    e('button', {
+                      type: 'button',
+                      className: 'pdf2zh-btn pdf2zh-btn-primary',
+                      disabled: savingGlossary,
+                      onClick: onSaveGlossary,
+                    }, savingGlossary ? '保存中…' : '保存'),
+                    e('button', { type: 'button', className: 'pdf2zh-btn', onClick: () => setEditingGlossary(false) }, '取消'),
+                  ),
+                )
+              : e('div', null,
+                  glossaryLines.length > 0 ? e('div', { className: 'pdf2zh-glossary-sample' },
+                    glossaryLines.map((l) => e('div', { key: l, className: 'pdf2zh-glossary-line' }, l)),
+                    glossary.terms > glossaryLines.length ? e('div', { className: 'pdf2zh-mut' }, `… 共 ${glossary.terms} 条`) : null,
+                  ) : e('div', { className: 'pdf2zh-mut' }, '（空）'),
+                  e('div', { className: 'pdf2zh-actions' },
+                    e('button', {
+                      type: 'button',
+                      className: 'pdf2zh-btn',
+                      onClick: () => { setGlossaryDraft(glossary.text); setEditingGlossary(true) },
+                    }, '编辑术语表'),
+                  ),
+                  e('details', { className: 'pdf2zh-preview' },
+                    e('summary', null, `全文（${glossary.terms} 条）`),
+                    e('pre', null, glossary.text),
+                  ),
+                ),
         ] }),
       ),
     ),
@@ -620,12 +728,17 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 
 .pdf2zh-top {
   flex: none;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+}
+.pdf2zh-top-inner {
+  max-width: 780px;
+  margin: 0 auto;
+  width: 100%;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px 20px;
-  border-bottom: 1px solid var(--dsw-alias-border-l2);
 }
 .pdf2zh-heading { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .pdf2zh-logo {
@@ -633,17 +746,17 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
   color: var(--dsw-alias-state-business-primary);
   background: var(--dsw-alias-interactive-bg-hover);
 }
-.pdf2zh-logo svg { width: 17px; height: 17px; }
+.pdf2zh-logo svg { width: 19px; height: 19px; }
 .pdf2zh-heading-text { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-.pdf2zh-title { font-size: 15px; font-weight: 600; white-space: nowrap; }
+.pdf2zh-title { font-size: 17px; font-weight: 600; white-space: nowrap; }
 .pdf2zh-tab {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--dsw-alias-label-tertiary);
   white-space: nowrap;
   overflow: hidden;
@@ -651,8 +764,8 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 }
 .pdf2zh-back {
   flex: none;
-  padding: 6px 12px;
-  font-size: 12px;
+  padding: 7px 14px;
+  font-size: 13px;
   border-radius: 8px;
   border: 1px solid var(--dsw-alias-border-l2);
   background: transparent;
@@ -663,7 +776,7 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 .pdf2zh-back:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
 
 .pdf2zh-scroll { flex: 1; overflow-y: auto; }
-.pdf2zh-content { max-width: 680px; margin: 0 auto; padding: 16px 20px 28px; display: flex; flex-direction: column; gap: 12px; }
+.pdf2zh-content { max-width: 780px; margin: 0 auto; padding: 18px 20px 32px; display: flex; flex-direction: column; gap: 14px; }
 
 /* --- workflow guide ---------------------------------------------------------- */
 
@@ -672,21 +785,21 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   align-items: center;
   flex-wrap: wrap;
   gap: 4px 6px;
-  padding: 8px 12px;
+  padding: 9px 14px;
   border-radius: 10px;
   border: 1px dashed var(--dsw-alias-border-l2);
   color: var(--dsw-alias-label-tertiary);
-  font-size: 12px;
+  font-size: 13px;
 }
 .pdf2zh-guide-step { display: inline-flex; align-items: center; gap: 5px; }
 .pdf2zh-guide-num {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   color: var(--dsw-alias-state-business-primary);
   background: var(--dsw-alias-interactive-bg-hover);
@@ -705,12 +818,12 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   display: flex;
   align-items: baseline;
   gap: 8px;
-  padding: 9px 14px;
+  padding: 10px 16px;
   border-bottom: 1px solid var(--dsw-alias-border-l1);
 }
-.pdf2zh-section-title { font-size: 13px; font-weight: 600; }
-.pdf2zh-section-note { font-size: 12px; color: var(--dsw-alias-label-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pdf2zh-section-body { padding: 13px 14px; display: flex; flex-direction: column; gap: 10px; }
+.pdf2zh-section-title { font-size: 14px; font-weight: 600; }
+.pdf2zh-section-note { font-size: 13px; color: var(--dsw-alias-label-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pdf2zh-section-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 11px; }
 
 /* success accent for result cards */
 .pdf2zh-section-success { border-color: var(--dsw-alias-state-success-primary); }
@@ -721,20 +834,42 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 .pdf2zh-input::placeholder { color: var(--dsw-alias-label-tertiary); }
 .pdf2zh-input:focus { border-color: var(--dsw-alias-state-business-primary); }
 .pdf2zh-options { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
-.pdf2zh-field { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--dsw-alias-label-secondary); }
-.pdf2zh-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--dsw-alias-label-secondary); cursor: pointer; user-select: none; }
+.pdf2zh-field { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--dsw-alias-label-secondary); }
+.pdf2zh-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--dsw-alias-label-secondary); cursor: pointer; user-select: none; }
 .pdf2zh-check input { accent-color: var(--dsw-alias-state-business-primary); }
+
+/* drop zone */
+.pdf2zh-drop {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1.5px dashed var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--dsw-alias-label-tertiary);
+  transition: border-color .12s ease, background-color .12s ease, color .12s ease;
+}
+.pdf2zh-drop:hover { border-color: var(--dsw-alias-state-business-primary); color: var(--dsw-alias-label-secondary); }
+.pdf2zh-drop-hot {
+  border-color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+.pdf2zh-drop-icon { display: inline-flex; flex: none; color: var(--dsw-alias-state-business-primary); }
+.pdf2zh-drop-icon svg { width: 18px; height: 18px; }
 
 /* recent paths */
 .pdf2zh-recent { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
-.pdf2zh-recent-label { font-size: 11px; color: var(--dsw-alias-label-tertiary); margin-right: 2px; }
+.pdf2zh-recent-label { font-size: 12px; color: var(--dsw-alias-label-tertiary); margin-right: 2px; }
 .pdf2zh-recent-chip {
   max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  padding: 3px 9px;
-  font-size: 11px;
+  padding: 4px 11px;
+  font-size: 12px;
   border-radius: 999px;
   border: 1px solid var(--dsw-alias-border-l2);
   background: transparent;
@@ -751,8 +886,8 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 /* actions */
 .pdf2zh-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .pdf2zh-btn {
-  padding: 7px 14px;
-  font-size: 13px;
+  padding: 8px 16px;
+  font-size: 14px;
   border-radius: 8px;
   border: 1px solid var(--dsw-alias-border-l2);
   background: transparent;
@@ -768,24 +903,24 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   color: var(--dsw-alias-label-primary-foreground, #fff);
 }
 .pdf2zh-btn-primary:hover:not(:disabled) { opacity: .88; background: var(--dsw-alias-state-business-primary); }
-.pdf2zh-hint { font-size: 11px; color: var(--dsw-alias-label-tertiary); }
+.pdf2zh-hint { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
 
 /* --- feedback ------------------------------------------------------------------- */
 
 .pdf2zh-error {
-  padding: 9px 12px;
-  font-size: 12px;
+  padding: 10px 13px;
+  font-size: 13px;
   border-radius: 8px;
   border: 1px solid var(--dsw-alias-state-error-primary);
   color: var(--dsw-alias-state-error-primary);
   white-space: pre-wrap;
   word-break: break-all;
 }
-.pdf2zh-mut { font-size: 12px; color: var(--dsw-alias-label-tertiary); line-height: 1.6; word-break: break-all; }
+.pdf2zh-mut { font-size: 13px; color: var(--dsw-alias-label-tertiary); line-height: 1.6; word-break: break-all; }
 .pdf2zh-mut code, .pdf2zh-section-body code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px;
-  padding: 1px 5px;
+  font-size: 12px;
+  padding: 1px 6px;
   border-radius: 4px;
   background: var(--dsw-alias-bg-layer-2);
   border: 1px solid var(--dsw-alias-border-l1);
@@ -796,13 +931,13 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   display: inline-flex;
   align-items: baseline;
   gap: 5px;
-  padding: 3px 10px;
+  padding: 4px 11px;
   border-radius: 999px;
   border: 1px solid var(--dsw-alias-state-success-primary);
   color: var(--dsw-alias-state-success-primary);
-  font-size: 11px;
+  font-size: 12px;
 }
-.pdf2zh-chip-value { font-size: 12px; font-weight: 600; }
+.pdf2zh-chip-value { font-size: 13px; font-weight: 600; }
 .pdf2zh-chip-label { opacity: .8; }
 .pdf2zh-outpath {
   flex: 1;
@@ -811,13 +946,13 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--dsw-alias-label-tertiary);
   text-align: right;
 }
 
 .pdf2zh-preview summary {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--dsw-alias-label-secondary);
   cursor: pointer;
   user-select: none;
@@ -829,7 +964,7 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   overflow: auto;
   padding: 10px 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.65;
   border-radius: 8px;
   background: var(--dsw-alias-bg-layer-2);
@@ -837,6 +972,24 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* glossary editor */
+.pdf2zh-glossary-edit { display: flex; flex-direction: column; gap: 9px; }
+.pdf2zh-glossary-textarea {
+  width: 100%;
+  min-height: 280px;
+  resize: vertical;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  outline: none;
+}
+.pdf2zh-glossary-textarea:focus { border-color: var(--dsw-alias-state-business-primary); }
 
 /* glossary sample */
 .pdf2zh-glossary-sample {
@@ -850,7 +1003,7 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 }
 .pdf2zh-glossary-line {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--dsw-alias-label-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -861,12 +1014,21 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 
 .pdf2zh-foot {
   flex: none;
-  padding: 7px 20px;
-  font-size: 11px;
+  padding: 8px 20px;
+  font-size: 12px;
   color: var(--dsw-alias-label-tertiary);
   border-top: 1px solid var(--dsw-alias-border-l2);
 }
-.pdf2zh-foot-inner { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
+.pdf2zh-foot-inner {
+  max-width: 780px;
+  margin: 0 auto;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
 .pdf2zh-foot-status { display: inline-flex; align-items: center; flex: none; gap: 12px; }
 .pdf2zh-foot-meta {
   min-width: 0;
