@@ -6,16 +6,14 @@
  * column with the single-occupant protocol (task-board / cron-explorer /
  * ssh / token-usage-board eviction).
  *
- * Panel: translation board (running / done / failed counts with per-file
- * progress bars, auto-refreshed), PDF path input (+ recent paths from
- * localStorage, drag-drop upload), options (pages / 中英对照 / 含附录),
- * extract preview with stat chips, one-click session translation, glossary
- * preview/editor, and a status strip with green/red health dots.
+ * Panel: translation board (stat cards + per-file progress bars,
+ * auto-refreshed), PDF path input (+ recent paths from localStorage,
+ * drag-drop upload), options, extract preview, one-click session
+ * translation, glossary editor, health footer.
  *
- * A header gear button opens a settings modal: translation model API picked
- * from the dsh LLM registry (all configured providers/models are listed, the
- * default resolves automatically and prefers the locally deployed one), the
- * output save directory, and the per-job timeout.
+ * The header "⚙ 设置" button opens a tabbed settings modal: 模型 API (all
+ * providers/models from the dsh LLM registry, click to set the translation
+ * default, auto = prefer local) and 输出与超时 (save dir + timeout presets).
  *
  * Failure policy mirrors the reference plugins: DOM mounting problems are
  * logged, never thrown — a throwing client apply fails the whole web boot.
@@ -191,22 +189,30 @@ class PanelController {
  * ------------------------------------------------------------------ */
 
 const RECENT_KEY = 'dsh-pdf2zh.recentPaths'
+const RECENT_DIR_KEY = 'dsh-pdf2zh.recentOutDirs'
 const RECENT_MAX = 4
+const RECENT_DIR_MAX = 3
 
-function readRecent(): string[] {
+function readRecentList(key: string, max: number): string[] {
   try {
-    const raw = localStorage.getItem(RECENT_KEY)
+    const raw = localStorage.getItem(key)
     if (!raw) return []
     const arr = JSON.parse(raw)
-    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string').slice(0, RECENT_MAX) : []
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string').slice(0, max) : []
   } catch {
     return []
   }
 }
 
 function pushRecent(path: string): string[] {
-  const next = [path, ...readRecent().filter((p) => p !== path)].slice(0, RECENT_MAX)
+  const next = [path, ...readRecentList(RECENT_KEY, RECENT_MAX).filter((p) => p !== path)].slice(0, RECENT_MAX)
   try { localStorage.setItem(RECENT_KEY, JSON.stringify(next)) } catch { /* private mode */ }
+  return next
+}
+
+function pushRecentDir(dir: string): string[] {
+  const next = [dir, ...readRecentList(RECENT_DIR_KEY, RECENT_DIR_MAX).filter((p) => p !== dir)].slice(0, RECENT_DIR_MAX)
+  try { localStorage.setItem(RECENT_DIR_KEY, JSON.stringify(next)) } catch { /* private mode */ }
   return next
 }
 
@@ -239,6 +245,33 @@ function fmtElapsed(ms: number): string {
 const STATUS_LABEL: Record<JobStatus, string> = { running: '进行中', done: '已完成', failed: '已失败' }
 
 /* ------------------------------------------------------------------ *\
+ * Icons (16/24 viewBox glyphs, currentColor)
+ * ------------------------------------------------------------------ */
+
+function svg(path: string, size = 16): any {
+  return e('svg', { viewBox: '0 0 24 24', fill: 'currentColor', width: size, height: size, 'aria-hidden': 'true' },
+    e('path', { d: path }))
+}
+
+const ICONS = {
+  gear: 'M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z',
+  sparkle: 'M12 2.5l1.9 5.3L19 9.7l-5.1 1.9L12 17l-1.9-5.4L5 9.7l5.1-1.9zM19 14l.9 2.4 2.3.9-2.3.9-.9 2.3-.9-2.3-2.3-.9 2.3-.9zM5.5 15l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z',
+  plug: 'M16 3v2h-2V3h-4v2H8V3H4v7c0 2.97 2.02 5.45 4.76 6.17L9 21h6l.24-4.83C17.98 15.45 20 12.97 20 10V3h-4zM8 10V5h2v3h4V5h2v5c0 2.21-1.79 4-4 4s-4-1.79-4-4z',
+  folder: 'M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z',
+  clock: 'M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z',
+  board: 'M3 3h8v10H3V3zm0 12h8v6H3v-6zM13 3h8v6h-8V3zm0 8h8v10h-8V11z',
+  doc: 'M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z',
+  book: 'M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 4h5v8l-2.5-1.5L6 12V4z',
+  check: 'M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z',
+  warn: 'M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z',
+  info: 'M11 7h2v2h-2V7zm0 4h2v6h-2v-6zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z',
+  upload: 'M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z',
+  translate: 'M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z',
+}
+
+function GearIcon(): any { return svg(ICONS.gear, 14) }
+
+/* ------------------------------------------------------------------ *\
  * Small building blocks
  * ------------------------------------------------------------------ */
 
@@ -254,11 +287,14 @@ const INPUT_STYLE: React.CSSProperties = {
   outline: 'none',
 }
 
-/** Section card: title + optional note + body. `children` may be an array. */
-function Section(props: { title: string; note?: string; accent?: 'success'; children: React.ReactNode }): any {
-  const { title, note, accent, children } = props
+/** Section card: title (with optional icon) + note + body. `children` may be an array. */
+function Section(props: { title: string; note?: string; accent?: 'success'; icon?: keyof typeof ICONS; children: React.ReactNode }): any {
+  const { title, note, accent, icon, children } = props
   return e('div', { className: `pdf2zh-section${accent ? ` pdf2zh-section-${accent}` : ''}` },
     e('div', { className: 'pdf2zh-section-head' },
+      icon
+        ? e('span', { className: 'pdf2zh-section-icon' }, svg(ICONS[icon], 15))
+        : null,
       e('span', { className: 'pdf2zh-section-title' }, title),
       note ? e('span', { className: 'pdf2zh-section-note' }, note) : null,
     ),
@@ -289,31 +325,43 @@ function HealthDot({ ok, label }: { ok: boolean; label: string }): any {
 
 function ProgressBar({ value, status }: { value: number; status: JobStatus | 'overall' }): any {
   const pct = Math.max(0, Math.min(100, Math.round(value * 100)))
-  return e('div', { className: 'pdf2zh-bar' },
+  return e('div', { className: `pdf2zh-bar${status === 'running' ? ' pdf2zh-bar-anim' : ''}` },
     e('div', { className: `pdf2zh-bar-fill pdf2zh-bar-${status}`, style: { width: `${pct}%` } }),
   )
 }
 
-function GearIcon(): any {
-  return e('svg', { viewBox: '0 0 24 24', fill: 'currentColor', 'aria-hidden': 'true' },
-    e('path', { d: 'M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z' }),
+/** Green/red feedback strips with a leading glyph. */
+function Strip({ kind, text }: { kind: 'notice' | 'error'; text: string }): any {
+  return e('div', { className: `pdf2zh-strip pdf2zh-strip-${kind}` },
+    e('span', { className: 'pdf2zh-strip-icon' }, svg(kind === 'notice' ? ICONS.check : ICONS.warn, 15)),
+    text,
   )
 }
 
 /* ------------------------------------------------------------------ *\
- * Settings modal (翻译模型 API / 保存路径 / 超时)
+ * Settings modal — tabbed (模型 API / 输出与超时)
  * ------------------------------------------------------------------ */
+
+const TIMEOUT_PRESETS = [
+  { v: 30, label: '30 分' },
+  { v: 60, label: '1 小时' },
+  { v: 120, label: '2 小时' },
+  { v: 240, label: '4 小时' },
+  { v: 720, label: '12 小时' },
+]
 
 function SettingsModal({ settings, onClose, onSaved }: {
   settings: Settings | null
   onClose: () => void
   onSaved: (s: Settings) => void
 }): any {
+  const [tab, setTab] = useState<'api' | 'output'>('api')
   const [models, setModels] = useState<ModelsResult | null>(null)
   const [modelsError, setModelsError] = useState('')
   const [savingModel, setSavingModel] = useState('')
   const [outputDir, setOutputDir] = useState(settings?.outputDir ?? '')
   const [timeoutMinutes, setTimeoutMinutes] = useState(String(settings?.timeoutMinutes ?? 240))
+  const [recentDirs, setRecentDirs] = useState<string[]>(() => readRecentList(RECENT_DIR_KEY, RECENT_DIR_MAX))
   const [savingForm, setSavingForm] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -340,7 +388,7 @@ function SettingsModal({ settings, onClose, onSaved }: {
       onSaved(next)
       setNotice(sel.provider === ''
         ? '已切回自动选择（优先本地部署 API）'
-        : `默认 API 已保存：${sel.provider} / ${sel.model}`)
+        : `默认翻译 API 已设为 ${sel.provider} / ${sel.model}`)
     } catch (err: any) {
       setError(err?.message ?? String(err))
     } finally {
@@ -358,8 +406,9 @@ function SettingsModal({ settings, onClose, onSaved }: {
         timeoutMinutes: Number(timeoutMinutes) || undefined,
       })
       onSaved(next)
+      if (next.outputDir !== '') setRecentDirs(pushRecentDir(next.outputDir))
       setNotice(next.outputDir
-        ? `已保存：译文将保存到 ${next.outputDir}（超时 ${next.timeoutMinutes} 分钟）`
+        ? `已保存：译文保存到 ${next.outputDir}（超时 ${next.timeoutMinutes} 分钟）`
         : `已保存：译文保存在源 PDF 同目录（超时 ${next.timeoutMinutes} 分钟）`)
     } catch (err: any) {
       setError(err?.message ?? String(err))
@@ -368,110 +417,190 @@ function SettingsModal({ settings, onClose, onSaved }: {
     }
   }, [outputDir, timeoutMinutes, onSaved])
 
+  const apiRow = (opts: {
+    key: string
+    active: boolean
+    busy: boolean
+    title?: string
+    onClick: () => void
+    name: React.ReactNode
+    sub: React.ReactNode
+    icon: React.ReactNode
+    tags?: React.ReactNode
+  }): any => e('button', {
+    key: opts.key,
+    type: 'button',
+    className: `pdf2zh-api-row${opts.active ? ' pdf2zh-api-row-active' : ''}${opts.busy ? ' pdf2zh-api-row-busy' : ''}`,
+    disabled: opts.busy,
+    title: opts.title,
+    onClick: opts.onClick,
+  },
+    opts.icon,
+    e('span', { className: 'pdf2zh-api-text' },
+      e('span', { className: 'pdf2zh-api-name' }, opts.name),
+      e('span', { className: 'pdf2zh-api-sub' }, opts.sub),
+    ),
+    opts.tags ?? null,
+    e('span', { className: `pdf2zh-api-check${opts.active ? ' pdf2zh-api-check-on' : ''}` },
+      opts.active ? svg(ICONS.check, 12) : null,
+    ),
+  )
+
   const modelRow = (providerId: string, providerName: string, m: { id: string; name: string; description: string }, isAutoLocal: boolean): any => {
-    const active = saved.provider === providerId && saved.model === m.id
     const key = `${providerId}/${m.id}`
-    return e('button', {
+    const active = saved.provider === providerId && saved.model === m.id
+    return apiRow({
       key,
-      type: 'button',
-      className: `pdf2zh-api-row${active ? ' pdf2zh-api-row-active' : ''}`,
-      disabled: savingModel !== '',
+      active,
+      busy: savingModel !== '',
       title: m.description || m.id,
       onClick: () => { void saveModel({ provider: providerId, model: m.id }) },
-    },
-      e('span', { className: 'pdf2zh-api-radio' }),
-      e('span', { className: 'pdf2zh-api-text' },
-        e('span', { className: 'pdf2zh-api-name' }, m.name !== m.id ? `${m.name} · ${m.id}` : m.id),
-        e('span', { className: 'pdf2zh-api-provider' }, providerName !== providerId ? `${providerName} (${providerId})` : providerId),
+      name: m.name !== m.id ? `${m.name} · ${m.id}` : m.id,
+      sub: providerName !== providerId ? `${providerName} (${providerId})` : providerId,
+      icon: e('span', { className: 'pdf2zh-api-avatar pdf2zh-api-avatar-plain' }, providerName.charAt(0).toUpperCase()),
+      tags: e('span', { className: 'pdf2zh-api-tags' },
+        isAutoLocal ? e('span', { className: 'pdf2zh-api-tag pdf2zh-api-tag-local' }, '本地') : null,
+        savingModel === key ? e('span', { className: 'pdf2zh-api-tag' }, '保存中…') : null,
       ),
-      isAutoLocal ? e('span', { className: 'pdf2zh-api-tag' }, '本地') : null,
-      active ? e('span', { className: 'pdf2zh-api-tag pdf2zh-api-tag-active' }, '默认') : null,
-      savingModel === key ? e('span', { className: 'pdf2zh-api-tag' }, '保存中…') : null,
-    )
+    })
   }
 
   return e('div', { className: 'pdf2zh-modal-mask', onClick: (ev: any) => { if (ev.target === ev.currentTarget) onClose() } },
     e('div', { className: 'pdf2zh-modal', role: 'dialog', 'aria-label': 'pdf2zh 设置' },
       e('div', { className: 'pdf2zh-modal-head' },
-        e('span', { className: 'pdf2zh-modal-title' }, '设置'),
-        e('button', { type: 'button', className: 'pdf2zh-job-del', onClick: onClose, title: '关闭（Esc）' }, '×'),
+        e('span', { className: 'pdf2zh-modal-icon' }, svg(ICONS.gear, 17)),
+        e('div', { className: 'pdf2zh-modal-titlewrap' },
+          e('div', { className: 'pdf2zh-modal-title' }, '设置'),
+          e('div', { className: 'pdf2zh-modal-sub' }, 'pdf2zh · 翻译模型 API 与输出'),
+        ),
+        e('button', { type: 'button', className: 'pdf2zh-modal-x', onClick: onClose, title: '关闭（Esc）' }, '×'),
       ),
+
+      e('div', { className: 'pdf2zh-tabs' },
+        e('button', { type: 'button', className: `pdf2zh-tab-btn${tab === 'api' ? ' pdf2zh-tab-on' : ''}`, onClick: () => setTab('api') },
+          svg(ICONS.plug, 14), '模型 API'),
+        e('button', { type: 'button', className: `pdf2zh-tab-btn${tab === 'output' ? ' pdf2zh-tab-on' : ''}`, onClick: () => setTab('output') },
+          svg(ICONS.folder, 14), '输出与超时'),
+      ),
+
       e('div', { className: 'pdf2zh-modal-body' },
-        e('div', { className: 'pdf2zh-modal-section-title' }, '翻译模型 API'),
-        e('div', { className: 'pdf2zh-mut' },
-          '与 dsh 本体共用同一份 API 注册表（在 dsh「设置 → 模型」里添加/配置 DeepSeek、Qwen 或本地部署的 API 后，此处自动同步可选）。开始翻译时会自动为新建会话选定该 API。',
-        ),
-        e('button', {
-          type: 'button',
-          className: `pdf2zh-api-row${saved.provider === '' ? ' pdf2zh-api-row-active' : ''}`,
-          disabled: savingModel !== '',
-          onClick: () => { void saveModel({ provider: '', model: '' }) },
-        },
-          e('span', { className: 'pdf2zh-api-radio' }),
-          e('span', { className: 'pdf2zh-api-text' },
-            e('span', { className: 'pdf2zh-api-name' }, '自动（优先本地部署 API）'),
-            e('span', { className: 'pdf2zh-api-provider' },
-              models?.auto ? `当前解析为：${models.auto.provider}/${models.auto.model}` : '每次翻译时按模型目录实时解析',
-            ),
-          ),
-          saved.provider === '' ? e('span', { className: 'pdf2zh-api-tag pdf2zh-api-tag-active' }, '默认') : null,
-        ),
-        models === null && modelsError === ''
-          ? e('div', { className: 'pdf2zh-mut' }, '正在读取模型目录…')
-          : null,
-        modelsError !== '' ? e('div', { className: 'pdf2zh-error' }, modelsError) : null,
-        models !== null
-          ? e('div', { className: 'pdf2zh-api-groups' },
-              models.providers.map((g) => e('div', { key: g.id, className: `pdf2zh-api-group${g.routable ? '' : ' pdf2zh-api-group-off'}` },
-                e('div', { className: 'pdf2zh-api-group-head' },
-                  e('span', null, g.name !== g.id ? `${g.name}（${g.id}）` : g.id),
-                  g.routable ? null : e('span', { className: 'pdf2zh-api-tag' }, '当前不可路由'),
-                ),
-                g.models.map((m) => modelRow(g.id, g.name, m, models.auto?.provider === g.id && models.auto?.model === m.id)),
-              )),
-              (models.failures ?? []).length > 0
-                ? e('div', { className: 'pdf2zh-mut' }, `部分 provider 读取失败：${models.failures.map((f) => f.id).join('、')}`)
+        tab === 'api'
+          ? e(React.Fragment, null,
+              e('div', { className: 'pdf2zh-modal-desc' },
+                svg(ICONS.info, 14),
+                e('span', null, '与 dsh 共用同一份 API 注册表：在 dsh「设置 → 模型」添加 DeepSeek / Qwen / 本地部署后，这里自动同步。点选即设为翻译默认。'),
+              ),
+              apiRow({
+                key: 'auto',
+                active: saved.provider === '',
+                busy: savingModel !== '',
+                onClick: () => { void saveModel({ provider: '', model: '' }) },
+                name: '自动选择（推荐 · 优先本地部署 API）',
+                sub: models?.auto
+                  ? `当前解析为 ${models.auto.provider} / ${models.auto.model}`
+                  : '每次开始翻译时按模型目录实时解析',
+                icon: e('span', { className: 'pdf2zh-auto-icon' }, svg(ICONS.sparkle, 15)),
+                tags: saved.provider === '' ? e('span', { className: 'pdf2zh-api-tags' }, e('span', { className: 'pdf2zh-api-tag pdf2zh-api-tag-active' }, '默认')) : null,
+              }),
+              models === null && modelsError === ''
+                ? e('div', { className: 'pdf2zh-mut' }, '正在读取模型目录…')
+                : null,
+              modelsError !== '' ? e(Strip, { kind: 'error', text: modelsError }) : null,
+              models !== null
+                ? e('div', { className: 'pdf2zh-api-groups' },
+                    models.providers.map((g) => e('div', { key: g.id, className: `pdf2zh-api-card${g.routable ? '' : ' pdf2zh-api-card-off'}` },
+                      e('div', { className: 'pdf2zh-api-card-head' },
+                        e('span', { className: 'pdf2zh-api-avatar' }, (g.name || g.id).charAt(0).toUpperCase()),
+                        e('span', { className: 'pdf2zh-api-card-name' },
+                          e('span', null, g.name !== g.id ? g.name : g.id),
+                          g.name !== g.id ? e('code', { className: 'pdf2zh-api-card-id' }, g.id) : null,
+                        ),
+                        e('span', { className: 'pdf2zh-api-card-tags' },
+                          g.routable
+                            ? e('span', { className: 'pdf2zh-api-tag pdf2zh-api-tag-ok' }, '可用')
+                            : e('span', { className: 'pdf2zh-api-tag pdf2zh-api-tag-warn' }, '暂不可路由'),
+                        ),
+                      ),
+                      e('div', { className: 'pdf2zh-api-card-body' },
+                        g.models.map((m) => modelRow(g.id, g.name, m, models.auto?.provider === g.id && models.auto?.model === m.id)),
+                      ),
+                    )),
+                    (models.failures ?? []).length > 0
+                      ? e('div', { className: 'pdf2zh-modal-warnline' },
+                          svg(ICONS.warn, 13), `部分 provider 读取失败：${models.failures.map((f) => f.id).join('、')}`)
+                      : null,
+                  )
                 : null,
             )
-          : null,
-        e('div', { className: 'pdf2zh-modal-section-title' }, '翻译输出'),
-        e('div', { className: 'pdf2zh-field-row' },
-          e('span', { className: 'pdf2zh-field-label' }, '保存路径'),
-          e('input', {
-            className: 'pdf2zh-input',
-            style: INPUT_STYLE,
-            value: outputDir,
-            placeholder: '留空 = 保存在源 PDF 同目录；例如 /data02/zhangqinhan/papers/translated',
-            onChange: (ev: any) => setOutputDir(ev.target.value),
-            spellCheck: false,
-          }),
-        ),
-        e('div', { className: 'pdf2zh-field-row' },
-          e('span', { className: 'pdf2zh-field-label' }, '任务超时（分钟，10–1440）'),
-          e('input', {
-            className: 'pdf2zh-input',
-            style: { ...INPUT_STYLE, width: 130 },
-            value: timeoutMinutes,
-            type: 'number',
-            min: 10,
-            max: 1440,
-            onChange: (ev: any) => setTimeoutMinutes(ev.target.value),
-          }),
-        ),
-        e('div', { className: 'pdf2zh-mut' },
-          '保存路径需为服务器上的绝对路径（自动创建）。若模型把译文写到了源 PDF 旁，任务完成时插件会兜底复制到这里。',
-        ),
-        error !== '' ? e('div', { className: 'pdf2zh-error' }, error) : null,
-        notice !== '' ? e('div', { className: 'pdf2zh-notice' }, notice) : null,
+          : e(React.Fragment, null,
+              e('div', { className: 'pdf2zh-modal-desc' },
+                svg(ICONS.info, 14),
+                e('span', null, '译文（.zh.md / 中英对照 .en-zh.md）的统一落盘位置与任务超时；对之后新发起的翻译生效。'),
+              ),
+              e('div', { className: 'pdf2zh-field-card' },
+                e('div', { className: 'pdf2zh-field-label' }, e('span', { className: 'pdf2zh-field-icon' }, svg(ICONS.folder, 14)), '保存路径'),
+                e('input', {
+                  className: 'pdf2zh-input pdf2zh-input-mono',
+                  style: INPUT_STYLE,
+                  value: outputDir,
+                  placeholder: '留空 = 保存在源 PDF 同目录；例如 /data02/zhangqinhan/papers/translated',
+                  onChange: (ev: any) => setOutputDir(ev.target.value),
+                  spellCheck: false,
+                }),
+                recentDirs.length > 0
+                  ? e('div', { className: 'pdf2zh-recent' },
+                      e('span', { className: 'pdf2zh-recent-label' }, '常用'),
+                      recentDirs.map((d) => e('button', {
+                        key: d,
+                        type: 'button',
+                        className: 'pdf2zh-recent-chip',
+                        title: d,
+                        onClick: () => setOutputDir(d),
+                      }, d.split('/').pop())),
+                    )
+                  : null,
+                e('div', { className: 'pdf2zh-field-hint' }, '需为服务器上的绝对路径（保存时自动创建）。若模型把译文写到源 PDF 旁，任务完成时插件会兜底复制到这里。'),
+              ),
+              e('div', { className: 'pdf2zh-field-card' },
+                e('div', { className: 'pdf2zh-field-label' }, e('span', { className: 'pdf2zh-field-icon' }, svg(ICONS.clock, 14)), '任务超时'),
+                e('div', { className: 'pdf2zh-preset-row' },
+                  TIMEOUT_PRESETS.map((p) => e('button', {
+                    key: p.v,
+                    type: 'button',
+                    className: `pdf2zh-preset${String(p.v) === timeoutMinutes ? ' pdf2zh-preset-on' : ''}`,
+                    onClick: () => setTimeoutMinutes(String(p.v)),
+                  }, p.label)),
+                  e('span', { className: 'pdf2zh-preset-custom' },
+                    e('input', {
+                      className: 'pdf2zh-input pdf2zh-preset-input',
+                      style: { ...INPUT_STYLE, padding: '6px 10px', fontSize: 13 },
+                      value: timeoutMinutes,
+                      type: 'number',
+                      min: 10,
+                      max: 1440,
+                      onChange: (ev: any) => setTimeoutMinutes(ev.target.value),
+                    }),
+                    e('span', { className: 'pdf2zh-preset-unit' }, '分钟'),
+                  ),
+                ),
+                e('div', { className: 'pdf2zh-field-hint' }, '10–1440 分钟。超时后插件会终止翻译会话并把任务记为失败。'),
+              ),
+            ),
+        error !== '' ? e(Strip, { kind: 'error', text: error }) : null,
+        notice !== '' ? e(Strip, { kind: 'notice', text: notice }) : null,
       ),
+
       e('div', { className: 'pdf2zh-modal-foot' },
-        e('button', {
+        e('span', { className: 'pdf2zh-foot-hint' },
+          tab === 'api' ? '点选后立即保存为默认，无需其它操作' : '修改后点右侧保存',
+        ),
+        tab === 'output' ? e('button', {
           type: 'button',
           className: 'pdf2zh-btn pdf2zh-btn-primary',
           disabled: savingForm,
           onClick: saveForm,
-        }, savingForm ? '保存中…' : '保存路径与超时'),
-        e('button', { type: 'button', className: 'pdf2zh-btn', onClick: onClose }, '关闭'),
+        }, savingForm ? '保存中…' : '保存') : null,
+        e('button', { type: 'button', className: 'pdf2zh-btn', onClick: onClose }, '完成'),
       ),
     ),
   )
@@ -485,6 +614,7 @@ function JobRow({ job, onDelete }: { job: Job; onDelete: (id: string) => void })
   const pct = Math.round(job.progress * 100)
   return e('div', { className: `pdf2zh-job pdf2zh-job-${job.status}`, key: job.id },
     e('div', { className: 'pdf2zh-job-head' },
+      e('span', { className: `pdf2zh-job-statusdot pdf2zh-job-statusdot-${job.status}` }),
       e('span', { className: 'pdf2zh-job-name', title: job.pdfPath }, job.pdfName),
       e('span', { className: `pdf2zh-badge pdf2zh-badge-${job.status}` }, STATUS_LABEL[job.status]),
       e('span', { className: 'pdf2zh-job-time', title: `创建：${fmtBeijing(job.createdAt)}` },
@@ -505,7 +635,7 @@ function JobRow({ job, onDelete }: { job: Job; onDelete: (id: string) => void })
     ),
     (job.provider !== '' || job.modelNote !== undefined)
       ? e('div', { className: 'pdf2zh-job-meta' },
-          job.provider !== '' ? e('span', null, `API ${job.provider}/${job.model}`) : null,
+          job.provider !== '' ? e('span', { className: 'pdf2zh-job-api' }, svg(ICONS.plug, 11), ` ${job.provider}/${job.model}`) : null,
           job.modelNote ? e('span', { className: 'pdf2zh-job-warn' }, job.modelNote) : null,
         )
       : null,
@@ -526,6 +656,13 @@ function JobRow({ job, onDelete }: { job: Job; onDelete: (id: string) => void })
   )
 }
 
+function StatCard({ status, value, label }: { status: 'running' | 'done' | 'failed'; value: number; label: string }): any {
+  return e('div', { className: `pdf2zh-statcard pdf2zh-statcard-${status}` },
+    e('div', { className: 'pdf2zh-statcard-value' }, String(value)),
+    e('div', { className: 'pdf2zh-statcard-label' }, label),
+  )
+}
+
 function Board({ jobs, summary, onDelete, onClear }: {
   jobs: Job[]
   summary: JobsResult['summary']
@@ -540,26 +677,30 @@ function Board({ jobs, summary, onDelete, onClear }: {
   return Section({
     title: '翻译看板',
     note: '每 5 秒自动刷新',
+    icon: 'board',
     children: [
-      e('div', { className: 'pdf2zh-board-stats' },
-        e('span', { className: 'pdf2zh-stat pdf2zh-stat-running' }, e('b', null, summary.running), '进行中'),
-        e('span', { className: 'pdf2zh-stat pdf2zh-stat-done' }, e('b', null, summary.done), '已完成'),
-        e('span', { className: 'pdf2zh-stat pdf2zh-stat-failed' }, e('b', null, summary.failed), '已失败'),
-        total > 0 ? e('span', { style: { flex: 1 } }) : null,
-        summary.done + summary.failed > 0 ? e('button', {
-          type: 'button',
-          className: 'pdf2zh-btn pdf2zh-btn-mini',
-          onClick: onClear,
-        }, '清空已完成') : null,
+      e('div', { className: 'pdf2zh-statcards' },
+        e(StatCard, { status: 'running', value: summary.running, label: '进行中' }),
+        e(StatCard, { status: 'done', value: summary.done, label: '已完成' }),
+        e(StatCard, { status: 'failed', value: summary.failed, label: '已失败' }),
       ),
       total > 0
         ? e('div', { className: 'pdf2zh-overall' },
-            e('span', { className: 'pdf2zh-overall-label' }, `总体 ${Math.round(overall * 100)}%`),
+            e('span', { className: 'pdf2zh-overall-label' }, '总体进度'),
             e(ProgressBar, { value: overall, status: overallStatus }),
+            e('span', { className: 'pdf2zh-overall-pct' }, `${Math.round(overall * 100)}%`),
+          )
+        : null,
+      total > 0 && summary.done + summary.failed > 0
+        ? e('div', { className: 'pdf2zh-board-tools' },
+            e('button', { type: 'button', className: 'pdf2zh-btn pdf2zh-btn-mini', onClick: onClear }, '清空已完成'),
           )
         : null,
       total === 0
-        ? e('div', { className: 'pdf2zh-mut' }, '暂无翻译任务：填好路径点「开始翻译」后，进度会在这里实时更新。')
+        ? e('div', { className: 'pdf2zh-empty' },
+            e('span', { className: 'pdf2zh-empty-icon' }, svg(ICONS.board, 22)),
+            e('span', null, '暂无翻译任务 — 填好路径点「开始翻译」后，进度会在这里实时更新'),
+          )
         : e('div', { className: 'pdf2zh-jobs' }, jobs.map((job) => e(JobRow, { key: job.id, job, onDelete }))),
     ],
   })
@@ -578,7 +719,7 @@ function Panel({ hide }: { hide: () => void }): any {
   const [pages, setPages] = useState('')
   const [bilingual, setBilingual] = useState(false)
   const [appendix, setAppendix] = useState(false)
-  const [recent, setRecent] = useState<string[]>(() => readRecent())
+  const [recent, setRecent] = useState<string[]>(() => readRecentList(RECENT_KEY, RECENT_MAX))
   const [extracting, setExtracting] = useState(false)
   const [translating, setTranslating] = useState(false)
   const [extract, setExtract] = useState<ExtractResult | null>(null)
@@ -744,29 +885,26 @@ function Panel({ hide }: { hide: () => void }): any {
     ? ''
     : settings.model.provider !== ''
       ? ` · ${settings.model.provider}/${settings.model.model}`
-      : ' · API 自动'
+      : ' · API 自动（本地优先）'
 
   return e('div', { className: 'pdf2zh-shell', role: 'region', 'aria-label': 'PDF 英转中' },
     e('header', { className: 'pdf2zh-top' },
       e('div', { className: 'pdf2zh-top-inner' },
       e('div', { className: 'pdf2zh-heading' },
-        e('span', { className: 'pdf2zh-logo' },
-          e('svg', { viewBox: '0 0 24 24', fill: 'currentColor', 'aria-hidden': 'true' },
-            e('path', { d: 'M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z' })),
-        ),
+        e('span', { className: 'pdf2zh-logo' }, svg(ICONS.translate, 19)),
         e('div', { className: 'pdf2zh-heading-text' },
           e('div', { className: 'pdf2zh-title' }, 'PDF 英转中'),
-          e('span', { className: 'pdf2zh-tab' }, 'pdf2zh · 轻量化学术论文 PDF 英转中'),
+          e('span', { className: 'pdf2zh-tabtitle' }, 'pdf2zh · 轻量化学术论文 PDF 英转中'),
         ),
       ),
       e('div', { className: 'pdf2zh-top-actions' },
         e('button', {
           type: 'button',
-          className: 'pdf2zh-back',
+          className: `pdf2zh-topbtn${modalOpen ? ' pdf2zh-topbtn-on' : ''}`,
           onClick: () => { setModalOpen(true) },
           title: '打开设置（翻译模型 API / 保存路径 / 超时）',
         }, e('span', { className: 'pdf2zh-gear' }, GearIcon()), '设置'),
-        e('button', { type: 'button', className: 'pdf2zh-back', onClick: hide }, '返回会话'),
+        e('button', { type: 'button', className: 'pdf2zh-topbtn', onClick: hide }, '返回会话'),
       ),
       ),
     ),
@@ -783,7 +921,7 @@ function Panel({ hide }: { hide: () => void }): any {
 
         e(Board, { jobs, summary, onDelete: onJobDelete, onClear: onJobsClear }),
 
-        Section({ title: '翻译论文', note: '填服务器上的 PDF 绝对路径，或直接拖拽/选择本地 PDF 上传', children: [
+        Section({ title: '翻译论文', note: '填服务器上的 PDF 绝对路径，或直接拖拽/选择本地 PDF 上传', icon: 'doc', children: [
           e('div', {
             className: `pdf2zh-drop${dragOver ? ' pdf2zh-drop-hot' : ''}`,
             onClick: () => { fileRef.current?.click() },
@@ -807,16 +945,13 @@ function Panel({ hide }: { hide: () => void }): any {
                 if (ev.target) ev.target.value = ''
               },
             }),
-            e('span', { className: 'pdf2zh-drop-icon' },
-              e('svg', { viewBox: '0 0 24 24', fill: 'currentColor', 'aria-hidden': 'true' },
-                e('path', { d: 'M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z' })),
-            ),
-            uploading
-              ? e('span', null, `正在上传 ${uploadName}…`)
-              : e('span', null, '拖拽 PDF 到此处，或点击选择文件上传到服务器'),
+            e('span', { className: 'pdf2zh-drop-icon' }, svg(ICONS.upload, 19)),
+            e('span', null, uploading
+              ? `正在上传 ${uploadName}…`
+              : '拖拽 PDF 到此处，或点击选择文件上传到服务器'),
           ),
           e('input', {
-            className: 'pdf2zh-input',
+            className: 'pdf2zh-input pdf2zh-input-mono',
             style: INPUT_STYLE,
             value: path,
             placeholder: '/data02/zhangqinhan/papers/attention.pdf',
@@ -865,16 +1000,16 @@ function Panel({ hide }: { hide: () => void }): any {
               className: 'pdf2zh-btn pdf2zh-btn-primary',
               disabled: !pathValid || busy,
               onClick: onTranslate,
-            }, translating ? '创建任务中…' : '开始翻译（新建会话）'),
+            }, translating ? '创建任务中…' : '开始翻译'),
             !pathValid ? e('span', { className: 'pdf2zh-hint' }, '回车 = 提取预览') : null,
           ),
         ] }),
 
-        notice !== '' ? e('div', { className: 'pdf2zh-notice' }, notice) : null,
-        error !== '' ? e('div', { className: 'pdf2zh-error' }, error) : null,
+        notice !== '' ? e(Strip, { kind: 'notice', text: notice }) : null,
+        error !== '' ? e(Strip, { kind: 'error', text: error }) : null,
 
         extract !== null
-          ? Section({ title: '提取完成', accent: 'success', children: [
+          ? Section({ title: '提取完成', accent: 'success', icon: 'check', children: [
             e('div', { className: 'pdf2zh-stats' },
               e(StatChip, { label: '页数', value: extract.pages }),
               e(StatChip, { label: '字符', value: extract.chars.toLocaleString() }),
@@ -887,7 +1022,7 @@ function Panel({ hide }: { hide: () => void }): any {
           ] })
           : null,
 
-        Section({ title: '术语表', note: '跨论文译名一致 · 可编辑', children: [
+        Section({ title: '术语表', note: '跨论文译名一致 · 可编辑', icon: 'book', children: [
           glossary === null
             ? e('div', { className: 'pdf2zh-mut' }, '暂不可用')
             : editingGlossary
@@ -942,7 +1077,7 @@ function Panel({ hide }: { hide: () => void }): any {
             ),
           )
         : healthError !== ''
-          ? e('span', { className: 'pdf2zh-error' }, healthError)
+          ? e('span', { className: 'pdf2zh-strip pdf2zh-strip-error' }, healthError)
           : e('span', { className: 'pdf2zh-mut' }, '连接中…'),
     ),
 
@@ -1142,6 +1277,23 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   display: none !important;
 }
 
+/* --- shared keyframes ---------------------------------------------------------- */
+
+@keyframes pdf2zh-fade { from { opacity: 0; } }
+@keyframes pdf2zh-pop {
+  from { opacity: 0; transform: translateY(10px) scale(.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes pdf2zh-slide { from { opacity: 0; transform: translateY(4px); } }
+@keyframes pdf2zh-shine {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(280%); }
+}
+@keyframes pdf2zh-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .35; }
+}
+
 /* --- panel shell ------------------------------------------------------------ */
 
 .pdf2zh-shell {
@@ -1179,13 +1331,13 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   width: 32px;
   height: 32px;
   border-radius: 9px;
-  color: var(--dsw-alias-state-business-primary);
-  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary-foreground, #fff);
+  background: linear-gradient(135deg, var(--dsw-alias-state-business-primary), var(--dsw-alias-brand-primary));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .12);
 }
-.pdf2zh-logo svg { width: 19px; height: 19px; }
 .pdf2zh-heading-text { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .pdf2zh-title { font-size: 17px; font-weight: 600; white-space: nowrap; }
-.pdf2zh-tab {
+.pdf2zh-tabtitle {
   font-size: 13px;
   color: var(--dsw-alias-label-tertiary);
   white-space: nowrap;
@@ -1193,7 +1345,7 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   text-overflow: ellipsis;
 }
 .pdf2zh-top-actions { display: inline-flex; align-items: center; gap: 8px; flex: none; }
-.pdf2zh-back {
+.pdf2zh-topbtn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1205,11 +1357,15 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   background: transparent;
   color: var(--dsw-alias-label-secondary);
   cursor: pointer;
-  transition: background-color .12s ease, color .12s ease;
+  transition: background-color .12s ease, color .12s ease, border-color .12s ease;
 }
-.pdf2zh-back:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.pdf2zh-topbtn:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.pdf2zh-topbtn-on {
+  border-color: var(--dsw-alias-state-business-primary);
+  color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
 .pdf2zh-gear { display: inline-flex; }
-.pdf2zh-gear svg { width: 14px; height: 14px; }
 
 .pdf2zh-scroll { flex: 1; overflow-y: auto; }
 .pdf2zh-content { max-width: 780px; margin: 0 auto; padding: 18px 20px 32px; display: flex; flex-direction: column; gap: 14px; }
@@ -1226,6 +1382,7 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   border: 1px dashed var(--dsw-alias-border-l2);
   color: var(--dsw-alias-label-tertiary);
   font-size: 13px;
+  background: linear-gradient(90deg, var(--dsw-alias-bg-layer-2), transparent 65%);
 }
 .pdf2zh-guide-step { display: inline-flex; align-items: center; gap: 5px; }
 .pdf2zh-guide-num {
@@ -1237,8 +1394,8 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   border-radius: 50%;
   font-size: 11px;
   font-weight: 600;
-  color: var(--dsw-alias-state-business-primary);
-  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary-foreground, #fff);
+  background: linear-gradient(135deg, var(--dsw-alias-state-business-primary), var(--dsw-alias-brand-primary));
 }
 .pdf2zh-guide-arrow { margin: 0 2px; opacity: .6; }
 
@@ -1246,24 +1403,38 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 
 .pdf2zh-section {
   border: 1px solid var(--dsw-alias-border-l2);
-  border-radius: 10px;
+  border-radius: 12px;
   overflow: hidden;
   background: var(--dsw-alias-bg-base);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .05);
 }
 .pdf2zh-section-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
-  padding: 10px 16px;
+  padding: 11px 16px;
   border-bottom: 1px solid var(--dsw-alias-border-l1);
+  background: linear-gradient(180deg, var(--dsw-alias-bg-layer-2), transparent);
+}
+.pdf2zh-section-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  flex: none;
+  color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
 }
 .pdf2zh-section-title { font-size: 14px; font-weight: 600; }
-.pdf2zh-section-note { font-size: 13px; color: var(--dsw-alias-label-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pdf2zh-section-note { font-size: 12px; color: var(--dsw-alias-label-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-left: auto; padding-left: 12px; }
 .pdf2zh-section-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 11px; }
 
 /* success accent for result cards */
 .pdf2zh-section-success { border-color: var(--dsw-alias-state-success-primary); }
 .pdf2zh-section-success .pdf2zh-section-title { color: var(--dsw-alias-state-success-primary); }
+.pdf2zh-section-success .pdf2zh-section-icon { color: var(--dsw-alias-state-success-primary); }
 
 /* --- settings modal ------------------------------------------------------------- */
 
@@ -1275,126 +1446,320 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: rgba(0, 0, 0, .42);
+  background: var(--dsw-alias-bg-mask-1, rgba(0, 0, 0, .45));
+  backdrop-filter: blur(3px);
+  animation: pdf2zh-fade .16s ease;
 }
 .pdf2zh-modal {
-  width: 560px;
+  width: 620px;
   max-width: 100%;
   max-height: 100%;
   display: flex;
   flex-direction: column;
-  border-radius: 12px;
-  border: 1px solid var(--dsw-alias-border-l2);
-  background: var(--dsw-alias-bg-base);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, .35);
+  border-radius: 14px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  background: var(--dsw-alias-bg-overlay, var(--dsw-alias-bg-base));
+  box-shadow: 0 24px 64px rgba(0, 0, 0, .35);
+  animation: pdf2zh-pop .18s ease;
+  overflow: hidden;
 }
 .pdf2zh-modal-head {
   flex: none;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--dsw-alias-border-l1);
+  gap: 10px;
+  padding: 14px 18px 12px;
 }
-.pdf2zh-modal-title { font-size: 15px; font-weight: 600; }
+.pdf2zh-modal-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  flex: none;
+  color: var(--dsw-alias-label-primary-foreground, #fff);
+  background: linear-gradient(135deg, var(--dsw-alias-state-business-primary), var(--dsw-alias-brand-primary));
+}
+.pdf2zh-modal-titlewrap { flex: 1; min-width: 0; }
+.pdf2zh-modal-title { font-size: 15px; font-weight: 600; line-height: 1.25; }
+.pdf2zh-modal-sub { font-size: 11px; color: var(--dsw-alias-label-tertiary); }
+.pdf2zh-modal-x {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  transition: background-color .12s ease, color .12s ease;
+}
+.pdf2zh-modal-x:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+
+.pdf2zh-tabs {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  margin: 0 18px;
+  padding: 3px;
+  border-radius: 9px;
+  background: var(--dsw-alias-bg-layer-2);
+}
+.pdf2zh-tab-btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  transition: background-color .12s ease, color .12s ease;
+}
+.pdf2zh-tab-btn:hover { color: var(--dsw-alias-label-primary); }
+.pdf2zh-tab-on {
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-state-business-primary);
+  font-weight: 600;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .12);
+}
+
 .pdf2zh-modal-body {
   flex: 1;
   overflow-y: auto;
-  padding: 14px 16px;
+  padding: 14px 18px;
   display: flex;
   flex-direction: column;
   gap: 10px;
+  animation: pdf2zh-slide .14s ease;
 }
-.pdf2zh-modal-section-title {
-  margin-top: 8px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--dsw-alias-label-secondary);
+.pdf2zh-modal-desc {
+  display: flex;
+  gap: 7px;
+  align-items: flex-start;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--dsw-alias-label-tertiary);
+  padding: 8px 11px;
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-2);
 }
-.pdf2zh-modal-section-title:first-child { margin-top: 0; }
+.pdf2zh-modal-desc svg { flex: none; margin-top: 2px; }
+.pdf2zh-modal-warnline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--dsw-alias-state-warn-primary, var(--dsw-alias-state-error-primary));
+}
 .pdf2zh-modal-foot {
   flex: none;
   display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-  padding: 12px 16px;
-  border-top: 1px solid var(--dsw-alias-border-l1);
-}
-.pdf2zh-api-groups { display: flex; flex-direction: column; gap: 8px; }
-.pdf2zh-api-group { display: flex; flex-direction: column; gap: 4px; }
-.pdf2zh-api-group-off { opacity: .5; }
-.pdf2zh-api-group-head {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--dsw-alias-label-tertiary);
-  display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 4px;
+  gap: 10px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+  background: linear-gradient(180deg, transparent, var(--dsw-alias-bg-layer-2));
 }
+.pdf2zh-foot-hint { flex: 1; min-width: 0; font-size: 11px; color: var(--dsw-alias-label-tertiary); }
+
+/* API rows */
 .pdf2zh-api-row {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
   width: 100%;
   text-align: left;
-  padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid transparent;
-  background: transparent;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-base);
   color: var(--dsw-alias-label-primary);
   cursor: pointer;
-  transition: background-color .12s ease, border-color .12s ease;
+  transition: border-color .12s ease, background-color .12s ease, transform .12s ease, box-shadow .12s ease;
 }
-.pdf2zh-api-row:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
-.pdf2zh-api-row:disabled { cursor: default; opacity: .7; }
-.pdf2zh-api-row-active { border-color: var(--dsw-alias-state-business-primary); background: var(--dsw-alias-interactive-bg-hover); }
-.pdf2zh-api-radio {
-  flex: none;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  border: 1.5px solid var(--dsw-alias-border-l2);
-}
-.pdf2zh-api-row-active .pdf2zh-api-radio {
+.pdf2zh-api-row:hover:not(:disabled) {
   border-color: var(--dsw-alias-state-business-primary);
-  background: radial-gradient(circle, var(--dsw-alias-state-business-primary) 0 4px, transparent 4.5px);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .08);
 }
-.pdf2zh-api-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.pdf2zh-api-name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pdf2zh-api-provider { font-size: 11px; color: var(--dsw-alias-label-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pdf2zh-api-tag {
-  flex: none;
+.pdf2zh-api-row:disabled { cursor: default; }
+.pdf2zh-api-row-busy { opacity: .65; }
+.pdf2zh-api-row-active {
+  border-color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-interactive-bg-hover-accent, var(--dsw-alias-interactive-bg-hover));
+  box-shadow: inset 3px 0 0 var(--dsw-alias-state-business-primary);
+}
+.pdf2zh-api-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.pdf2zh-api-name { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pdf2zh-api-sub {
   font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pdf2zh-api-tags { display: inline-flex; gap: 5px; flex: none; }
+.pdf2zh-api-tag {
+  font-size: 10.5px;
   padding: 2px 8px;
   border-radius: 999px;
-  border: 1px solid currentColor;
+  border: 1px solid var(--dsw-alias-border-l2);
   color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
 }
-.pdf2zh-api-tag-active { color: var(--dsw-alias-state-business-primary); }
+.pdf2zh-api-tag-active { color: var(--dsw-alias-state-business-primary); border-color: currentColor; font-weight: 600; }
+.pdf2zh-api-tag-local { color: var(--dsw-alias-state-success-primary); border-color: currentColor; }
+.pdf2zh-api-tag-ok { color: var(--dsw-alias-state-success-primary); border-color: currentColor; }
+.pdf2zh-api-tag-warn { color: var(--dsw-alias-state-warn-primary, var(--dsw-alias-state-error-primary)); border-color: currentColor; }
+.pdf2zh-api-check {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1.5px solid var(--dsw-alias-border-l3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dsw-alias-label-primary-foreground, #fff);
+  transition: border-color .12s ease, background-color .12s ease;
+}
+.pdf2zh-api-check-on {
+  border-color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-state-business-primary);
+}
+.pdf2zh-auto-icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.pdf2zh-api-avatar {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.pdf2zh-api-avatar-plain { width: 22px; height: 22px; border-radius: 7px; font-size: 11px; }
+
+.pdf2zh-api-groups { display: flex; flex-direction: column; gap: 10px; }
+.pdf2zh-api-card {
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.pdf2zh-api-card-off { opacity: .55; }
+.pdf2zh-api-card-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 11px;
+  border-bottom: 1px dashed var(--dsw-alias-border-l1);
+  background: linear-gradient(180deg, var(--dsw-alias-bg-layer-2), transparent);
+}
+.pdf2zh-api-card-name { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 7px; font-size: 13px; font-weight: 600; overflow: hidden; }
+.pdf2zh-api-card-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--dsw-alias-label-tertiary);
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+  padding: 0 5px;
+  border-radius: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pdf2zh-api-card-tags { flex: none; }
+.pdf2zh-api-card-body { padding: 7px; display: flex; flex-direction: column; gap: 5px; }
+.pdf2zh-api-card-body .pdf2zh-api-row { border-color: transparent; background: var(--dsw-alias-bg-layer-1, transparent); }
+.pdf2zh-api-card-body .pdf2zh-api-row-active { border-color: var(--dsw-alias-state-business-primary); background: var(--dsw-alias-interactive-bg-hover-accent, var(--dsw-alias-interactive-bg-hover)); }
+
+/* output tab fields */
+.pdf2zh-field-card {
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.pdf2zh-field-icon {
+  display: inline-flex;
+  vertical-align: -2px;
+  margin-right: 6px;
+  color: var(--dsw-alias-state-business-primary);
+}
+.pdf2zh-input-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px !important; }
+.pdf2zh-field-hint { font-size: 11.5px; color: var(--dsw-alias-label-tertiary); line-height: 1.6; }
+.pdf2zh-preset-row { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+.pdf2zh-preset {
+  padding: 5px 13px;
+  font-size: 12px;
+  border-radius: 999px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  transition: background-color .12s ease, color .12s ease, border-color .12s ease;
+}
+.pdf2zh-preset:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.pdf2zh-preset-on {
+  border-color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-interactive-bg-hover-accent, var(--dsw-alias-interactive-bg-hover));
+  color: var(--dsw-alias-state-business-primary);
+  font-weight: 600;
+}
+.pdf2zh-preset-custom { display: inline-flex; align-items: center; gap: 6px; }
+.pdf2zh-preset-input { width: 78px !important; text-align: center; }
+.pdf2zh-preset-unit { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
 
 /* --- translation board --------------------------------------------------------- */
 
-.pdf2zh-board-stats { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-.pdf2zh-stat {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  padding: 4px 12px;
-  border-radius: 999px;
-  border: 1px solid currentColor;
-  font-size: 12px;
+.pdf2zh-statcards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.pdf2zh-statcard {
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-left-width: 3px;
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: var(--dsw-alias-bg-base);
 }
-.pdf2zh-stat b { font-size: 14px; font-weight: 700; }
-.pdf2zh-stat-running { color: var(--dsw-alias-state-business-primary); }
-.pdf2zh-stat-done { color: var(--dsw-alias-state-success-primary); }
-.pdf2zh-stat-failed { color: var(--dsw-alias-state-error-primary); }
-.pdf2zh-btn-mini { padding: 4px 11px; font-size: 12px; }
+.pdf2zh-statcard-value { font-size: 22px; font-weight: 700; line-height: 1.2; }
+.pdf2zh-statcard-label { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
+.pdf2zh-statcard-running { border-left-color: var(--dsw-alias-state-business-primary); }
+.pdf2zh-statcard-running .pdf2zh-statcard-value { color: var(--dsw-alias-state-business-primary); }
+.pdf2zh-statcard-done { border-left-color: var(--dsw-alias-state-success-primary); }
+.pdf2zh-statcard-done .pdf2zh-statcard-value { color: var(--dsw-alias-state-success-primary); }
+.pdf2zh-statcard-failed { border-left-color: var(--dsw-alias-state-error-primary); }
+.pdf2zh-statcard-failed .pdf2zh-statcard-value { color: var(--dsw-alias-state-error-primary); }
 
 .pdf2zh-overall { display: flex; align-items: center; gap: 10px; }
-.pdf2zh-overall-label { flex: none; width: 72px; font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.pdf2zh-overall-label { flex: none; font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.pdf2zh-overall-pct { flex: none; width: 42px; text-align: right; font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-secondary); }
+.pdf2zh-board-tools { display: flex; justify-content: flex-end; }
 
 .pdf2zh-bar {
+  position: relative;
   flex: 1;
   min-width: 0;
   height: 8px;
@@ -1408,20 +1773,35 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 .pdf2zh-bar-done { background: var(--dsw-alias-state-success-primary); }
 .pdf2zh-bar-failed { background: var(--dsw-alias-state-error-primary); }
 .pdf2zh-bar-overall { background: linear-gradient(90deg, var(--dsw-alias-state-business-primary), var(--dsw-alias-state-success-primary)); }
+.pdf2zh-bar-anim .pdf2zh-bar-fill::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 36%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .28), transparent);
+  animation: pdf2zh-shine 1.6s ease-in-out infinite;
+}
 
 .pdf2zh-jobs { display: flex; flex-direction: column; gap: 10px; }
 .pdf2zh-job {
   border: 1px solid var(--dsw-alias-border-l1);
-  border-radius: 8px;
-  padding: 10px 12px;
+  border-radius: 10px;
+  padding: 11px 13px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 8px;
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  transition: border-color .12s ease, box-shadow .12s ease;
 }
+.pdf2zh-job:hover { box-shadow: 0 3px 12px rgba(0, 0, 0, .07); }
 .pdf2zh-job-running { border-color: var(--dsw-alias-state-business-primary); }
-.pdf2zh-job-done { border-color: var(--dsw-alias-state-success-primary); }
+.pdf2zh-job-done { border-color: var(--dsw-alias-state-success-secondary, var(--dsw-alias-state-success-primary)); }
 .pdf2zh-job-failed { border-color: var(--dsw-alias-state-error-primary); }
 .pdf2zh-job-head { display: flex; align-items: center; gap: 8px; }
+.pdf2zh-job-statusdot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.pdf2zh-job-statusdot-running { background: var(--dsw-alias-state-business-primary); animation: pdf2zh-pulse 1.4s ease-in-out infinite; }
+.pdf2zh-job-statusdot-done { background: var(--dsw-alias-state-success-primary); }
+.pdf2zh-job-statusdot-failed { background: var(--dsw-alias-state-error-primary); }
 .pdf2zh-job-name {
   flex: 1;
   min-width: 0;
@@ -1432,7 +1812,7 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   white-space: nowrap;
 }
 .pdf2zh-badge { flex: none; font-size: 11px; padding: 2px 9px; border-radius: 999px; border: 1px solid currentColor; }
-.pdf2zh-badge-running { color: var(--dsw-alias-state-business-primary); }
+.pdf2zh-badge-running { color: var(--dsw-alias-state-business-primary); background: var(--dsw-alias-interactive-bg-hover); }
 .pdf2zh-badge-done { color: var(--dsw-alias-state-success-primary); }
 .pdf2zh-badge-failed { color: var(--dsw-alias-state-error-primary); }
 .pdf2zh-job-time { flex: none; font-size: 11px; color: var(--dsw-alias-label-tertiary); }
@@ -1462,17 +1842,41 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   color: var(--dsw-alias-label-tertiary);
   word-break: break-all;
 }
+.pdf2zh-job-api { display: inline-flex; align-items: center; gap: 4px; color: var(--dsw-alias-label-secondary); }
+.pdf2zh-job-api svg { flex: none; }
 .pdf2zh-job-error { color: var(--dsw-alias-state-error-primary); }
 .pdf2zh-job-warn { color: var(--dsw-alias-state-error-primary); opacity: .85; }
+
+.pdf2zh-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 26px 14px;
+  border: 1px dashed var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 13px;
+}
+.pdf2zh-empty-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-dimmed, var(--dsw-alias-label-tertiary));
+}
 
 /* --- form ---------------------------------------------------------------------- */
 
 .pdf2zh-input::placeholder { color: var(--dsw-alias-label-tertiary); }
-.pdf2zh-input:focus { border-color: var(--dsw-alias-state-business-primary); }
+.pdf2zh-input:focus { border-color: var(--dsw-alias-state-business-primary); box-shadow: 0 0 0 3px rgba(0, 122, 255, .12); }
 .pdf2zh-options { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
 .pdf2zh-field { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--dsw-alias-label-secondary); }
 .pdf2zh-field-row { display: flex; flex-direction: column; gap: 6px; }
-.pdf2zh-field-label { font-size: 13px; color: var(--dsw-alias-label-secondary); }
+.pdf2zh-field-label { display: inline-flex; align-items: center; font-size: 13px; color: var(--dsw-alias-label-secondary); }
 .pdf2zh-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--dsw-alias-label-secondary); cursor: pointer; user-select: none; }
 .pdf2zh-check input { accent-color: var(--dsw-alias-state-business-primary); }
 
@@ -1480,13 +1884,15 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 .pdf2zh-drop {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 10px;
-  padding: 12px 14px;
+  padding: 16px 14px;
   border: 1.5px dashed var(--dsw-alias-border-l2);
-  border-radius: 10px;
+  border-radius: 12px;
   cursor: pointer;
   font-size: 13px;
   color: var(--dsw-alias-label-tertiary);
+  background: linear-gradient(180deg, transparent, var(--dsw-alias-bg-layer-2));
   transition: border-color .12s ease, background-color .12s ease, color .12s ease;
 }
 .pdf2zh-drop:hover { border-color: var(--dsw-alias-state-business-primary); color: var(--dsw-alias-label-secondary); }
@@ -1495,8 +1901,17 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   background: var(--dsw-alias-interactive-bg-hover);
   color: var(--dsw-alias-label-primary);
 }
-.pdf2zh-drop-icon { display: inline-flex; flex: none; color: var(--dsw-alias-state-business-primary); }
-.pdf2zh-drop-icon svg { width: 18px; height: 18px; }
+.pdf2zh-drop-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
 
 /* recent paths */
 .pdf2zh-recent { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
@@ -1531,24 +1946,52 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   background: transparent;
   color: var(--dsw-alias-label-primary);
   cursor: pointer;
-  transition: background-color .12s ease, opacity .12s ease, border-color .12s ease;
+  transition: background-color .12s ease, opacity .12s ease, border-color .12s ease, transform .12s ease;
 }
 .pdf2zh-btn:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+.pdf2zh-btn:active:not(:disabled) { transform: scale(.98); }
 .pdf2zh-btn:disabled { opacity: .45; cursor: not-allowed; }
 .pdf2zh-btn-primary {
-  background: var(--dsw-alias-state-business-primary);
-  border-color: var(--dsw-alias-state-business-primary);
+  background: linear-gradient(135deg, var(--dsw-alias-state-business-primary), var(--dsw-alias-brand-primary));
+  border-color: transparent;
   color: var(--dsw-alias-label-primary-foreground, #fff);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .15);
 }
-.pdf2zh-btn-primary:hover:not(:disabled) { opacity: .88; background: var(--dsw-alias-state-business-primary); }
+.pdf2zh-btn-primary:hover:not(:disabled) { opacity: .92; background: linear-gradient(135deg, var(--dsw-alias-state-business-primary), var(--dsw-alias-brand-primary)); }
+.pdf2zh-btn-mini { padding: 4px 11px; font-size: 12px; }
 .pdf2zh-hint { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
 
 /* --- feedback ------------------------------------------------------------------- */
 
+.pdf2zh-strip {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 13px;
+  font-size: 13px;
+  border-radius: 10px;
+  line-height: 1.55;
+  animation: pdf2zh-slide .14s ease;
+}
+.pdf2zh-strip-icon { flex: none; display: inline-flex; margin-top: 2px; }
+.pdf2zh-strip-error {
+  border: 1px solid var(--dsw-alias-state-error-primary);
+  background: var(--dsw-alias-state-error-secondary, transparent);
+  color: var(--dsw-alias-state-error-primary);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.pdf2zh-strip-notice {
+  border: 1px solid var(--dsw-alias-state-success-primary);
+  background: var(--dsw-alias-state-success-secondary, transparent);
+  color: var(--dsw-alias-state-success-primary);
+  word-break: break-all;
+}
+/* legacy classes still referenced by JobRow-free contexts */
 .pdf2zh-error {
   padding: 10px 13px;
   font-size: 13px;
-  border-radius: 8px;
+  border-radius: 10px;
   border: 1px solid var(--dsw-alias-state-error-primary);
   color: var(--dsw-alias-state-error-primary);
   white-space: pre-wrap;
@@ -1557,7 +2000,7 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 .pdf2zh-notice {
   padding: 10px 13px;
   font-size: 13px;
-  border-radius: 8px;
+  border-radius: 10px;
   border: 1px solid var(--dsw-alias-state-success-primary);
   color: var(--dsw-alias-state-success-primary);
   word-break: break-all;
