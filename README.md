@@ -12,7 +12,8 @@
 - **提取预览**：面板里填服务器上的 PDF 路径（或直接**拖拽/选择本地 PDF 上传**，文件落到 `<DSH home>/pdf2zh/uploads/`，重名自动加 `-1` 后缀），点「提取预览」即可看到页数/字符数与前 1200 字符抽查结果（提取产物为 PDF 同目录的 `<同名>.txt`，带 `[PAGE n]` 标记）。
 - **一键翻译**：点「开始翻译（新建会话）」，插件通过 `sessionController` 新建一个真实 DSH 会话（工作区取保存目录，未设置则为 PDF 所在目录），自动重命名为 `[pdf2zh] <文件名>`，并把触发 pdf2zh 技能的提示词排进队列；任务随即出现在「翻译看板」上，**无需进入会话**即可跟踪到结束。
 - **翻译看板**：面板顶部实时汇总**进行中 / 已完成 / 已失败**的文件数量与总体进度条，每个文件带独立进度条（按译文 `.zh.md` 的落盘字节数估算，完成即 100%）。会话状态由 host 权威结算：轮询 `sessionController.list` 的 `running` 标志 + `sessionQuery` 的 `turn/end` 事件证据判定成败与结束时间；超时（默认 240 分钟）自动终止会话并记为失败。看板支持单条移除与「清空已完成」，账本持久化在 `<DSH home>/pdf2zh/jobs.json`，host 重启后自动续跑/补结算。
-- **保存路径设置**：面板「设置」区可指定翻译结果（`.zh.md`、中英对照 `.en-zh.md`）的保存目录（服务器上的绝对路径，保存时自动创建；留空 = 与源 PDF 同目录）。提示词会显式要求会话把产出写入该目录；若模型仍写到源目录，任务完成时插件会把译文**兜底复制**到指定目录。设置存于 `<DSH home>/pdf2zh/settings.json`。
+- **设置弹窗**：点击面板右上角「⚙ 设置」按钮打开（不占用主面板）。包含三项：**翻译模型 API**（见下）、**保存路径**（译文 `.zh.md` / `.en-zh.md` 的落盘目录，服务器上的绝对路径、自动创建，留空 = 源 PDF 同目录）、**任务超时**（分钟）。提示词会显式要求会话把产出写入保存目录；若模型仍写到源目录，任务完成时插件会把译文**兜底复制**到指定目录。设置持久化在 `<DSH home>/pdf2zh/settings.json`。
+- **模型 API 选择**：弹窗列出 dsh 本体同一份 LLM 注册表里的全部 API（DeepSeek、Qwen、本地部署等，在 dsh「设置 → 模型」中添加/改密钥后自动同步），点选即保存为默认。开始翻译按「本次指定 > 已保存默认 > 自动（优先本地部署）」解析并用 `sessionController.selectModel` 绑定到新会话；所选 API 暂不可用时自动回退、在看板任务上标注原因，不阻塞翻译。
 - **选项**：页码范围（如 `1-8`、`1,3,5-9`，**默认留空 = 全文**）、中英对照（额外产出 `<同名>.en-zh.md`）、含附录（默认只翻正文）。
 - **术语表在线编辑**：面板里可直接编辑并保存术语表（`POST /glossary` 写回 `glossary.md`），格式为每行一条 `英文: 中文`（`#` 开头为注释）。
 - **界面**：顶部为「填 PDF 路径 → 提取预览 → 开始翻译 → 看板看进度」四步引导；看板置于引导下方、全程可见（每 5 秒自动刷新）；路径输入下方保留最近使用过的路径（localStorage，点击即回填，回车直接提取）；提取成功以绿色卡片展示页数/字符统计与输出路径，可折叠抽查前 1200 字符；术语表卡片内联展示前 5 条、可展开全文；底部状态条以绿/红圆点区分 PyMuPDF 与技能同步的健康状态。
@@ -65,10 +66,11 @@ systemctl --user restart dsh-web   # 或你托管 dsh web 的方式
 | `/api/pdf2zh/glossary` | GET | 当前术语表（条数 + 全文） |
 | `/api/pdf2zh/glossary` | POST | `{text}` → 保存术语表，返回新条数 |
 | `/api/pdf2zh/extract` | POST | `{path, pages?}` → 运行 extract.py，返回 `{outPath, pages, chars, preview}` |
-| `/api/pdf2zh/translate` | POST | `{path, pages?, bilingual?, appendix?, sourceChars?, workspace?}` → 新建会话、排队技能提示词并登记看板任务，返回 `{sessionId, cwd, title, jobId}` |
+| `/api/pdf2zh/translate` | POST | `{path, pages?, bilingual?, appendix?, sourceChars?, model?, workspace?}` → 新建会话、绑定模型 API、排队技能提示词并登记看板任务，返回 `{sessionId, cwd, title, jobId, provider, model}` |
 | `/api/pdf2zh/upload` | POST | 原始 PDF 二进制（文件名在 `x-pdf2zh-filename` 头，percent-encoded）→ 存入 `uploadDir`，返回 `{path, filename, bytes}` |
-| `/api/pdf2zh/settings` | GET | 当前 UI 设置（`{outputDir, timeoutMinutes}`） |
-| `/api/pdf2zh/settings` | POST | `{outputDir?, timeoutMinutes?}` → 校验并持久化设置（自动建目录） |
+| `/api/pdf2zh/settings` | GET | 当前 UI 设置（`{outputDir, timeoutMinutes, model}`） |
+| `/api/pdf2zh/settings` | POST | `{outputDir?, timeoutMinutes?, model?}` → 校验并持久化设置（自动建目录；`model:{provider,model}` 留空对 = 自动优先本地） |
+| `/api/pdf2zh/models` | GET | dsh 模型目录：全部 provider/模型、当前默认、解析出的自动选择（本地优先） |
 | `/api/pdf2zh/jobs` | GET | 看板数据：全部任务（含实时 `progress`/`elapsedMs`）+ `summary` 计数 |
 | `/api/pdf2zh/jobs/delete` | POST | `{id}` → 从看板移除一条任务 |
 | `/api/pdf2zh/jobs/clear` | POST | `{}` → 清空全部已完成/已失败任务（保留进行中） |

@@ -9,9 +9,13 @@
  * Panel: translation board (running / done / failed counts with per-file
  * progress bars, auto-refreshed), PDF path input (+ recent paths from
  * localStorage, drag-drop upload), options (pages / 中英对照 / 含附录),
- * extract preview with stat chips, one-click session translation, a save-path
- * setting (where .zh.md outputs land), glossary preview/editor, and a status
- * strip with green/red health dots.
+ * extract preview with stat chips, one-click session translation, glossary
+ * preview/editor, and a status strip with green/red health dots.
+ *
+ * A header gear button opens a settings modal: translation model API picked
+ * from the dsh LLM registry (all configured providers/models are listed, the
+ * default resolves automatically and prefers the locally deployed one), the
+ * output save directory, and the per-job timeout.
  *
  * Failure policy mirrors the reference plugins: DOM mounting problems are
  * logged, never thrown — a throwing client apply fails the whole web boot.
@@ -75,6 +79,9 @@ interface Job {
   sessionId: string
   cwd: string
   outputDir: string
+  provider: string
+  model: string
+  modelNote?: string
   pages: string
   bilingual: boolean
   appendix: boolean
@@ -89,10 +96,39 @@ interface Job {
   outputPaths?: string[]
 }
 
+interface ModelSelection {
+  provider: string
+  model: string
+}
+
 interface Settings {
   ok: boolean
   outputDir: string
   timeoutMinutes: number
+  model: ModelSelection
+}
+
+interface TranslateResult {
+  ok: boolean
+  sessionId: string
+  jobId: string
+  provider: string
+  model: string
+  modelNote?: string
+}
+
+interface ModelsResult {
+  ok: boolean
+  default: (ModelSelection & { reasoningEffort?: string }) | null
+  saved: ModelSelection
+  auto: ModelSelection | null
+  providers: Array<{
+    id: string
+    name: string
+    routable: boolean
+    models: Array<{ id: string; name: string; description: string }>
+  }>
+  failures: Array<{ id: string; name: string; message: string }>
 }
 
 interface JobsResult {
@@ -111,14 +147,18 @@ const api = {
     bilingual?: boolean
     appendix?: boolean
     sourceChars?: number
-  }): Promise<{ ok: boolean; sessionId: string; jobId: string }> =>
-    call<{ ok: boolean; sessionId: string; jobId: string }>(`${API_PREFIX}/translate`, 'POST', body),
+  }): Promise<TranslateResult> =>
+    call<TranslateResult>(`${API_PREFIX}/translate`, 'POST', body),
   glossary: (): Promise<Glossary> => call<Glossary>(`${API_PREFIX}/glossary`, 'GET'),
   glossarySave: (text: string): Promise<{ ok: boolean; path: string; terms: number }> =>
     call<{ ok: boolean; path: string; terms: number }>(`${API_PREFIX}/glossary`, 'POST', { text }),
   settings: (): Promise<Settings> => call<Settings>(`${API_PREFIX}/settings`, 'GET'),
-  settingsSave: (body: { outputDir: string }): Promise<Settings> =>
-    call<Settings>(`${API_PREFIX}/settings`, 'POST', body),
+  settingsSave: (body: {
+    outputDir?: string
+    timeoutMinutes?: number
+    model?: ModelSelection
+  }): Promise<Settings> => call<Settings>(`${API_PREFIX}/settings`, 'POST', body),
+  models: (): Promise<ModelsResult> => call<ModelsResult>(`${API_PREFIX}/models`, 'GET'),
   jobs: (): Promise<JobsResult> => call<JobsResult>(`${API_PREFIX}/jobs`, 'GET'),
   jobDelete: (id: string): Promise<{ ok: boolean }> => call<{ ok: boolean }>(`${API_PREFIX}/jobs/delete`, 'POST', { id }),
   jobsClear: (): Promise<{ ok: boolean; removed: number }> => call<{ ok: boolean; removed: number }>(`${API_PREFIX}/jobs/clear`, 'POST', {}),
@@ -254,6 +294,189 @@ function ProgressBar({ value, status }: { value: number; status: JobStatus | 'ov
   )
 }
 
+function GearIcon(): any {
+  return e('svg', { viewBox: '0 0 24 24', fill: 'currentColor', 'aria-hidden': 'true' },
+    e('path', { d: 'M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z' }),
+  )
+}
+
+/* ------------------------------------------------------------------ *\
+ * Settings modal (翻译模型 API / 保存路径 / 超时)
+ * ------------------------------------------------------------------ */
+
+function SettingsModal({ settings, onClose, onSaved }: {
+  settings: Settings | null
+  onClose: () => void
+  onSaved: (s: Settings) => void
+}): any {
+  const [models, setModels] = useState<ModelsResult | null>(null)
+  const [modelsError, setModelsError] = useState('')
+  const [savingModel, setSavingModel] = useState('')
+  const [outputDir, setOutputDir] = useState(settings?.outputDir ?? '')
+  const [timeoutMinutes, setTimeoutMinutes] = useState(String(settings?.timeoutMinutes ?? 240))
+  const [savingForm, setSavingForm] = useState(false)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+
+  useEffect(() => {
+    if (settings !== null) {
+      setOutputDir(settings.outputDir)
+      setTimeoutMinutes(String(settings.timeoutMinutes))
+    }
+  }, [settings])
+
+  useEffect(() => {
+    api.models().then(setModels).catch((err: any) => setModelsError(err?.message ?? String(err)))
+  }, [])
+
+  const saved = settings?.model ?? { provider: '', model: '' }
+
+  const saveModel = useCallback(async (sel: ModelSelection): Promise<void> => {
+    setError('')
+    setNotice('')
+    setSavingModel(`${sel.provider}/${sel.model}`)
+    try {
+      const next = await api.settingsSave({ model: sel })
+      onSaved(next)
+      setNotice(sel.provider === ''
+        ? '已切回自动选择（优先本地部署 API）'
+        : `默认 API 已保存：${sel.provider} / ${sel.model}`)
+    } catch (err: any) {
+      setError(err?.message ?? String(err))
+    } finally {
+      setSavingModel('')
+    }
+  }, [onSaved])
+
+  const saveForm = useCallback(async (): Promise<void> => {
+    setError('')
+    setNotice('')
+    setSavingForm(true)
+    try {
+      const next = await api.settingsSave({
+        outputDir: outputDir.trim(),
+        timeoutMinutes: Number(timeoutMinutes) || undefined,
+      })
+      onSaved(next)
+      setNotice(next.outputDir
+        ? `已保存：译文将保存到 ${next.outputDir}（超时 ${next.timeoutMinutes} 分钟）`
+        : `已保存：译文保存在源 PDF 同目录（超时 ${next.timeoutMinutes} 分钟）`)
+    } catch (err: any) {
+      setError(err?.message ?? String(err))
+    } finally {
+      setSavingForm(false)
+    }
+  }, [outputDir, timeoutMinutes, onSaved])
+
+  const modelRow = (providerId: string, providerName: string, m: { id: string; name: string; description: string }, isAutoLocal: boolean): any => {
+    const active = saved.provider === providerId && saved.model === m.id
+    const key = `${providerId}/${m.id}`
+    return e('button', {
+      key,
+      type: 'button',
+      className: `pdf2zh-api-row${active ? ' pdf2zh-api-row-active' : ''}`,
+      disabled: savingModel !== '',
+      title: m.description || m.id,
+      onClick: () => { void saveModel({ provider: providerId, model: m.id }) },
+    },
+      e('span', { className: 'pdf2zh-api-radio' }),
+      e('span', { className: 'pdf2zh-api-text' },
+        e('span', { className: 'pdf2zh-api-name' }, m.name !== m.id ? `${m.name} · ${m.id}` : m.id),
+        e('span', { className: 'pdf2zh-api-provider' }, providerName !== providerId ? `${providerName} (${providerId})` : providerId),
+      ),
+      isAutoLocal ? e('span', { className: 'pdf2zh-api-tag' }, '本地') : null,
+      active ? e('span', { className: 'pdf2zh-api-tag pdf2zh-api-tag-active' }, '默认') : null,
+      savingModel === key ? e('span', { className: 'pdf2zh-api-tag' }, '保存中…') : null,
+    )
+  }
+
+  return e('div', { className: 'pdf2zh-modal-mask', onClick: (ev: any) => { if (ev.target === ev.currentTarget) onClose() } },
+    e('div', { className: 'pdf2zh-modal', role: 'dialog', 'aria-label': 'pdf2zh 设置' },
+      e('div', { className: 'pdf2zh-modal-head' },
+        e('span', { className: 'pdf2zh-modal-title' }, '设置'),
+        e('button', { type: 'button', className: 'pdf2zh-job-del', onClick: onClose, title: '关闭（Esc）' }, '×'),
+      ),
+      e('div', { className: 'pdf2zh-modal-body' },
+        e('div', { className: 'pdf2zh-modal-section-title' }, '翻译模型 API'),
+        e('div', { className: 'pdf2zh-mut' },
+          '与 dsh 本体共用同一份 API 注册表（在 dsh「设置 → 模型」里添加/配置 DeepSeek、Qwen 或本地部署的 API 后，此处自动同步可选）。开始翻译时会自动为新建会话选定该 API。',
+        ),
+        e('button', {
+          type: 'button',
+          className: `pdf2zh-api-row${saved.provider === '' ? ' pdf2zh-api-row-active' : ''}`,
+          disabled: savingModel !== '',
+          onClick: () => { void saveModel({ provider: '', model: '' }) },
+        },
+          e('span', { className: 'pdf2zh-api-radio' }),
+          e('span', { className: 'pdf2zh-api-text' },
+            e('span', { className: 'pdf2zh-api-name' }, '自动（优先本地部署 API）'),
+            e('span', { className: 'pdf2zh-api-provider' },
+              models?.auto ? `当前解析为：${models.auto.provider}/${models.auto.model}` : '每次翻译时按模型目录实时解析',
+            ),
+          ),
+          saved.provider === '' ? e('span', { className: 'pdf2zh-api-tag pdf2zh-api-tag-active' }, '默认') : null,
+        ),
+        models === null && modelsError === ''
+          ? e('div', { className: 'pdf2zh-mut' }, '正在读取模型目录…')
+          : null,
+        modelsError !== '' ? e('div', { className: 'pdf2zh-error' }, modelsError) : null,
+        models !== null
+          ? e('div', { className: 'pdf2zh-api-groups' },
+              models.providers.map((g) => e('div', { key: g.id, className: `pdf2zh-api-group${g.routable ? '' : ' pdf2zh-api-group-off'}` },
+                e('div', { className: 'pdf2zh-api-group-head' },
+                  e('span', null, g.name !== g.id ? `${g.name}（${g.id}）` : g.id),
+                  g.routable ? null : e('span', { className: 'pdf2zh-api-tag' }, '当前不可路由'),
+                ),
+                g.models.map((m) => modelRow(g.id, g.name, m, models.auto?.provider === g.id && models.auto?.model === m.id)),
+              )),
+              (models.failures ?? []).length > 0
+                ? e('div', { className: 'pdf2zh-mut' }, `部分 provider 读取失败：${models.failures.map((f) => f.id).join('、')}`)
+                : null,
+            )
+          : null,
+        e('div', { className: 'pdf2zh-modal-section-title' }, '翻译输出'),
+        e('div', { className: 'pdf2zh-field-row' },
+          e('span', { className: 'pdf2zh-field-label' }, '保存路径'),
+          e('input', {
+            className: 'pdf2zh-input',
+            style: INPUT_STYLE,
+            value: outputDir,
+            placeholder: '留空 = 保存在源 PDF 同目录；例如 /data02/zhangqinhan/papers/translated',
+            onChange: (ev: any) => setOutputDir(ev.target.value),
+            spellCheck: false,
+          }),
+        ),
+        e('div', { className: 'pdf2zh-field-row' },
+          e('span', { className: 'pdf2zh-field-label' }, '任务超时（分钟，10–1440）'),
+          e('input', {
+            className: 'pdf2zh-input',
+            style: { ...INPUT_STYLE, width: 130 },
+            value: timeoutMinutes,
+            type: 'number',
+            min: 10,
+            max: 1440,
+            onChange: (ev: any) => setTimeoutMinutes(ev.target.value),
+          }),
+        ),
+        e('div', { className: 'pdf2zh-mut' },
+          '保存路径需为服务器上的绝对路径（自动创建）。若模型把译文写到了源 PDF 旁，任务完成时插件会兜底复制到这里。',
+        ),
+        error !== '' ? e('div', { className: 'pdf2zh-error' }, error) : null,
+        notice !== '' ? e('div', { className: 'pdf2zh-notice' }, notice) : null,
+      ),
+      e('div', { className: 'pdf2zh-modal-foot' },
+        e('button', {
+          type: 'button',
+          className: 'pdf2zh-btn pdf2zh-btn-primary',
+          disabled: savingForm,
+          onClick: saveForm,
+        }, savingForm ? '保存中…' : '保存路径与超时'),
+        e('button', { type: 'button', className: 'pdf2zh-btn', onClick: onClose }, '关闭'),
+      ),
+    ),
+  )
+}
+
 /* ------------------------------------------------------------------ *\
  * Translation board
  * ------------------------------------------------------------------ */
@@ -280,6 +503,12 @@ function JobRow({ job, onDelete }: { job: Job; onDelete: (id: string) => void })
       e(ProgressBar, { value: job.progress, status: job.status }),
       e('span', { className: `pdf2zh-job-pct pdf2zh-job-pct-${job.status}` }, `${pct}%`),
     ),
+    (job.provider !== '' || job.modelNote !== undefined)
+      ? e('div', { className: 'pdf2zh-job-meta' },
+          job.provider !== '' ? e('span', null, `API ${job.provider}/${job.model}`) : null,
+          job.modelNote ? e('span', { className: 'pdf2zh-job-warn' }, job.modelNote) : null,
+        )
+      : null,
     job.status === 'done' && (job.outputPaths?.length ?? 0) > 0
       ? e('div', { className: 'pdf2zh-job-meta' },
           job.outputPaths!.map((p) => e('span', { key: p, className: 'pdf2zh-job-out' }, `→ ${p}`)),
@@ -364,9 +593,10 @@ function Panel({ hide }: { hide: () => void }): any {
   const [savingGlossary, setSavingGlossary] = useState(false)
   const [jobs, setJobs] = useState<Job[]>([])
   const [summary, setSummary] = useState<JobsResult['summary']>({ running: 0, done: 0, failed: 0 })
-  const [outputDir, setOutputDir] = useState('')
-  const [savedOutputDir, setSavedOutputDir] = useState<string | null>(null)
-  const [savingSettings, setSavingSettings] = useState(false)
+  const [settings, setSettings] = useState<Settings | null>(null)
+  const [modalOpen, setModalOpen] = useState(false)
+  const modalRef = useRef(false)
+  modalRef.current = modalOpen
   const fileRef = useRef<HTMLInputElement | null>(null)
   const healthTimer = useRef<ReturnType<typeof setInterval> | null>(null)
   const jobsTimer = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -383,21 +613,22 @@ function Panel({ hide }: { hide: () => void }): any {
     api.jobs().then((r) => { setJobs(r.jobs); setSummary(r.summary) }).catch(() => { /* board will retry */ })
   }, [])
 
-  const refreshSettings = useCallback((fill: boolean): void => {
-    api.settings().then((s) => {
-      setSavedOutputDir(s.outputDir)
-      if (fill) setOutputDir(s.outputDir)
-    }).catch(() => { /* settings section will show raw state */ })
+  const refreshSettings = useCallback((): void => {
+    api.settings().then(setSettings).catch(() => { /* modal will show raw state */ })
   }, [])
 
   useEffect(() => {
     refreshHealth()
     refreshGlossary()
     refreshJobs()
-    refreshSettings(true)
+    refreshSettings()
     healthTimer.current = setInterval(refreshHealth, 30_000)
     jobsTimer.current = setInterval(refreshJobs, 5_000)
-    const onKey = (ev: KeyboardEvent): void => { if (ev.key === 'Escape') hide() }
+    const onKey = (ev: KeyboardEvent): void => {
+      if (ev.key !== 'Escape') return
+      if (modalRef.current) setModalOpen(false)
+      else hide()
+    }
     window.addEventListener('keydown', onKey)
     return () => {
       if (healthTimer.current !== null) clearInterval(healthTimer.current)
@@ -449,25 +680,6 @@ function Panel({ hide }: { hide: () => void }): any {
     }
   }, [glossaryDraft, refreshGlossary])
 
-  const onSaveSettings = useCallback(async (): Promise<void> => {
-    setSavingSettings(true)
-    setError('')
-    setNotice('')
-    try {
-      const saved = await api.settingsSave({ outputDir: outputDir.trim() })
-      setOutputDir(saved.outputDir)
-      setSavedOutputDir(saved.outputDir)
-      setNotice(saved.outputDir
-        ? `设置已保存：译文 .zh.md 将保存到 ${saved.outputDir}`
-        : '设置已保存：译文将保存在源 PDF 同目录')
-      refreshJobs()
-    } catch (err: any) {
-      setError(err?.message ?? String(err))
-    } finally {
-      setSavingSettings(false)
-    }
-  }, [outputDir, refreshJobs])
-
   const onExtract = useCallback(async (): Promise<void> => {
     if (!path.trim()) return
     setError('')
@@ -492,7 +704,7 @@ function Panel({ hide }: { hide: () => void }): any {
     setTranslating(true)
     try {
       const trimmed = path.trim()
-      await api.translate({
+      const result = await api.translate({
         path: trimmed,
         pages: pages.trim() || undefined,
         bilingual,
@@ -500,7 +712,8 @@ function Panel({ hide }: { hide: () => void }): any {
         sourceChars: extract !== null && extract.pdfPath === trimmed ? extract.chars : undefined,
       })
       remember(trimmed)
-      setNotice('翻译任务已创建，进度见上方「翻译看板」（无需打开会话）。')
+      const via = result.provider ? `（API ${result.provider}/${result.model}）` : ''
+      setNotice(`翻译任务已创建${via}，进度见上方「翻译看板」。`)
       refreshJobs()
     } catch (err: any) {
       setError(err?.message ?? String(err))
@@ -527,7 +740,11 @@ function Panel({ hide }: { hide: () => void }): any {
   const pathValid = path.trim().length > 0
   const busy = extracting || translating
   const glossaryLines = glossary ? glossary.text.split('\n').filter(isGlossaryTerm).slice(0, 5) : []
-  const settingsDirty = savedOutputDir !== null && outputDir.trim() !== savedOutputDir
+  const modelLabel = settings === null
+    ? ''
+    : settings.model.provider !== ''
+      ? ` · ${settings.model.provider}/${settings.model.model}`
+      : ' · API 自动'
 
   return e('div', { className: 'pdf2zh-shell', role: 'region', 'aria-label': 'PDF 英转中' },
     e('header', { className: 'pdf2zh-top' },
@@ -542,7 +759,15 @@ function Panel({ hide }: { hide: () => void }): any {
           e('span', { className: 'pdf2zh-tab' }, 'pdf2zh · 轻量化学术论文 PDF 英转中'),
         ),
       ),
-      e('button', { type: 'button', className: 'pdf2zh-back', onClick: hide }, '返回会话'),
+      e('div', { className: 'pdf2zh-top-actions' },
+        e('button', {
+          type: 'button',
+          className: 'pdf2zh-back',
+          onClick: () => { setModalOpen(true) },
+          title: '打开设置（翻译模型 API / 保存路径 / 超时）',
+        }, e('span', { className: 'pdf2zh-gear' }, GearIcon()), '设置'),
+        e('button', { type: 'button', className: 'pdf2zh-back', onClick: hide }, '返回会话'),
+      ),
       ),
     ),
 
@@ -662,36 +887,6 @@ function Panel({ hide }: { hide: () => void }): any {
           ] })
           : null,
 
-        Section({ title: '设置', note: '翻译结果保存位置', children: [
-          e('div', { className: 'pdf2zh-field-row' },
-            e('span', { className: 'pdf2zh-field-label' }, '保存路径'),
-            e('input', {
-              className: 'pdf2zh-input',
-              style: INPUT_STYLE,
-              value: outputDir,
-              placeholder: '留空 = 保存在源 PDF 同目录；例如 /data02/zhangqinhan/papers/translated',
-              onChange: (ev: any) => setOutputDir(ev.target.value),
-              spellCheck: false,
-            }),
-          ),
-          e('div', { className: 'pdf2zh-mut' },
-            '指定后，翻译产出的中文 Markdown（.zh.md，含中英对照版）会统一保存到该目录（需为服务器上的绝对路径）；留空则保持与源 PDF 同目录。',
-          ),
-          e('div', { className: 'pdf2zh-actions' },
-            e('button', {
-              type: 'button',
-              className: 'pdf2zh-btn pdf2zh-btn-primary',
-              disabled: !settingsDirty || savingSettings,
-              onClick: onSaveSettings,
-            }, savingSettings ? '保存中…' : '保存设置'),
-            savedOutputDir !== null
-              ? e('span', { className: 'pdf2zh-hint' },
-                  savedOutputDir === '' ? '当前：源 PDF 同目录' : `当前：${savedOutputDir}`,
-                )
-              : null,
-          ),
-        ] }),
-
         Section({ title: '术语表', note: '跨论文译名一致 · 可编辑', children: [
           glossary === null
             ? e('div', { className: 'pdf2zh-mut' }, '暂不可用')
@@ -743,13 +938,15 @@ function Panel({ hide }: { hide: () => void }): any {
               e(HealthDot, { ok: health.skill.synced, label: health.skill.synced ? '技能已同步' : '技能未同步' }),
             ),
             e('span', { className: 'pdf2zh-foot-meta', title: health.skill.synced ? health.skill.dir : '' },
-              `v${health.version} · ${health.python}${health.skill.synced ? ` · ${health.skill.dir}` : ''}`,
+              `v${health.version} · ${health.python}${modelLabel}`,
             ),
           )
         : healthError !== ''
           ? e('span', { className: 'pdf2zh-error' }, healthError)
           : e('span', { className: 'pdf2zh-mut' }, '连接中…'),
     ),
+
+    modalOpen ? e(SettingsModal, { settings, onClose: () => setModalOpen(false), onSaved: setSettings }) : null,
   )
 }
 
@@ -835,7 +1032,11 @@ function mountPanel(controller: PanelController): () => void {
   }
 
   const onKey = (ev: KeyboardEvent): void => {
-    if (ev.key === 'Escape' && controller.getSnapshot()) controller.hide()
+    // While the settings modal is open the Panel's own handler closes it;
+    // this outer listener must not tear the whole panel down as well.
+    if (ev.key === 'Escape' && controller.getSnapshot() && document.querySelector('.pdf2zh-modal-mask') === null) {
+      controller.hide()
+    }
   }
 
   document.addEventListener('click', onClickSidebarRow, true)
@@ -944,6 +1145,7 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 /* --- panel shell ------------------------------------------------------------ */
 
 .pdf2zh-shell {
+  position: relative;
   box-sizing: border-box;
   height: 100%;
   display: flex;
@@ -990,7 +1192,11 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.pdf2zh-top-actions { display: inline-flex; align-items: center; gap: 8px; flex: none; }
 .pdf2zh-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   flex: none;
   padding: 7px 14px;
   font-size: 13px;
@@ -1002,6 +1208,8 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   transition: background-color .12s ease, color .12s ease;
 }
 .pdf2zh-back:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.pdf2zh-gear { display: inline-flex; }
+.pdf2zh-gear svg { width: 14px; height: 14px; }
 
 .pdf2zh-scroll { flex: 1; overflow-y: auto; }
 .pdf2zh-content { max-width: 780px; margin: 0 auto; padding: 18px 20px 32px; display: flex; flex-direction: column; gap: 14px; }
@@ -1056,6 +1264,114 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 /* success accent for result cards */
 .pdf2zh-section-success { border-color: var(--dsw-alias-state-success-primary); }
 .pdf2zh-section-success .pdf2zh-section-title { color: var(--dsw-alias-state-success-primary); }
+
+/* --- settings modal ------------------------------------------------------------- */
+
+.pdf2zh-modal-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, .42);
+}
+.pdf2zh-modal {
+  width: 560px;
+  max-width: 100%;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  border-radius: 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-base);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .35);
+}
+.pdf2zh-modal-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+.pdf2zh-modal-title { font-size: 15px; font-weight: 600; }
+.pdf2zh-modal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.pdf2zh-modal-section-title {
+  margin-top: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-secondary);
+}
+.pdf2zh-modal-section-title:first-child { margin-top: 0; }
+.pdf2zh-modal-foot {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+.pdf2zh-api-groups { display: flex; flex-direction: column; gap: 8px; }
+.pdf2zh-api-group { display: flex; flex-direction: column; gap: 4px; }
+.pdf2zh-api-group-off { opacity: .5; }
+.pdf2zh-api-group-head {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-tertiary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+.pdf2zh-api-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+  transition: background-color .12s ease, border-color .12s ease;
+}
+.pdf2zh-api-row:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+.pdf2zh-api-row:disabled { cursor: default; opacity: .7; }
+.pdf2zh-api-row-active { border-color: var(--dsw-alias-state-business-primary); background: var(--dsw-alias-interactive-bg-hover); }
+.pdf2zh-api-radio {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1.5px solid var(--dsw-alias-border-l2);
+}
+.pdf2zh-api-row-active .pdf2zh-api-radio {
+  border-color: var(--dsw-alias-state-business-primary);
+  background: radial-gradient(circle, var(--dsw-alias-state-business-primary) 0 4px, transparent 4.5px);
+}
+.pdf2zh-api-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.pdf2zh-api-name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pdf2zh-api-provider { font-size: 11px; color: var(--dsw-alias-label-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pdf2zh-api-tag {
+  flex: none;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  color: var(--dsw-alias-label-tertiary);
+}
+.pdf2zh-api-tag-active { color: var(--dsw-alias-state-business-primary); }
 
 /* --- translation board --------------------------------------------------------- */
 

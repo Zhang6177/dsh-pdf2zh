@@ -14,8 +14,9 @@
  *       POST /extract       — run the PyMuPDF extractor on a server-side PDF path
  *       POST /translate     — open a fresh session, queue the pdf2zh prompt, record a job
  *       POST /upload        — drag-drop PDF upload (raw body, filename in x-pdf2zh-filename)
- *       GET  /settings      — current UI settings (output dir / timeout)
+ *       GET  /settings      — current UI settings (output dir / timeout / model)
  *       POST /settings      — persist UI settings (~/.dsh/pdf2zh/settings.json)
+ *       GET  /models        — the dsh LLM registry (providers/models + auto pick)
  *       GET  /jobs          — translation job board (statuses + progress)
  *       POST /jobs/delete   — remove one job from the board
  *       POST /jobs/clear    — remove all finished (done/failed) jobs
@@ -96,6 +97,7 @@ class Pdf2Zh {
     this.settings = {
       outputDir: typeof config.outputDir === 'string' ? config.outputDir : '',
       timeoutMinutes: clampTimeout(config.timeoutMinutes),
+      model: { provider: '', model: '' },
     }
     this.jobs = []
     this.jobsLoaded = false
@@ -207,6 +209,11 @@ class Pdf2Zh {
       if (typeof raw.timeoutMinutes === 'number') {
         this.settings.timeoutMinutes = clampTimeout(raw.timeoutMinutes)
       }
+      if (raw.model && typeof raw.model === 'object') {
+        const provider = typeof raw.model.provider === 'string' ? raw.model.provider.trim() : ''
+        const model = typeof raw.model.model === 'string' ? raw.model.model.trim() : ''
+        if (provider !== '' && model !== '') this.settings.model = { provider, model }
+      }
     } catch { /* first boot: keep config defaults */ }
   }
 
@@ -215,6 +222,7 @@ class Pdf2Zh {
     await writeFile(this.settingsPath, JSON.stringify({
       outputDir: this.settings.outputDir,
       timeoutMinutes: this.settings.timeoutMinutes,
+      model: this.settings.model,
     }, null, 2), { mode: 0o644 })
   }
 
@@ -237,6 +245,19 @@ class Pdf2Zh {
     }
     if (patch.timeoutMinutes !== undefined) {
       next.timeoutMinutes = clampTimeout(patch.timeoutMinutes)
+    }
+    if (patch.model !== undefined) {
+      const raw = patch.model
+      if (raw === null || typeof raw !== 'object') throw new Error('model 需为 {provider, model} 对象（或 {provider:"", model:""} 恢复自动）')
+      const provider = typeof raw.provider === 'string' ? raw.provider.trim() : ''
+      const model = typeof raw.model === 'string' ? raw.model.trim() : ''
+      if (provider === '' && model === '') {
+        next.model = { provider: '', model: '' }
+      } else if (provider !== '' && model !== '') {
+        next.model = { provider, model }
+      } else {
+        throw new Error('model 的 provider 与 model 必须同时给出或同时为空')
+      }
     }
     this.settings = next
     await this.saveSettings()
@@ -524,11 +545,66 @@ class Pdf2Zh {
     return { outPath, pages: Number(m[2]), chars: Number(m[3]), preview }
   }
 
+  /* ---------------- model catalog (dsh 的完整 API 注册表) ---------------- */
+
+  async modelCatalogSafe() {
+    try {
+      const sessionController = this.ctx.get('sessionController')
+      if (typeof sessionController?.modelCatalog !== 'function') return null
+      return await sessionController.modelCatalog()
+    } catch {
+      return null
+    }
+  }
+
+  catalogGroups(catalog) {
+    const routable = Array.isArray(catalog?.routableProviders) && catalog.routableProviders.length > 0
+      ? catalog.routableProviders
+      : null
+    return (catalog?.groups ?? []).filter((g) => (g.models ?? []).length > 0 && (routable === null || routable.includes(g.id)))
+  }
+
+  isSelectionAvailable(catalog, sel) {
+    return sel?.provider && sel?.model
+      ? this.catalogGroups(catalog).some((g) => g.id === sel.provider && (g.models ?? []).some((m) => m.id === sel.model))
+      : false
+  }
+
+  /** Automatic default: prefer a locally deployed provider, else the host default. */
+  pickDefaultSelection(catalog) {
+    if (catalog == null) return { selection: null, note: '模型目录不可用，会话将使用 host 默认模型' }
+    const groups = this.catalogGroups(catalog)
+    const local = groups.find((g) => /local|self|vllm|ollama|本地/i.test(`${g.id} ${g.name ?? ''}`))
+    if (local !== undefined) return { selection: { provider: local.id, model: local.models[0].id }, note: '' }
+    if (typeof catalog.default?.provider === 'string' && typeof catalog.default?.model === 'string') {
+      return { selection: { provider: catalog.default.provider, model: catalog.default.model }, note: '' }
+    }
+    if (groups.length > 0) return { selection: { provider: groups[0].id, model: groups[0].models[0].id }, note: '' }
+    return { selection: null, note: '模型目录为空，会话将使用 host 默认模型' }
+  }
+
+  /** explicit body override > saved setting > auto (local-first) default. */
+  async resolveModelSelection(requested) {
+    const catalog = await this.modelCatalogSafe()
+    if (requested?.provider && requested?.model) {
+      if (this.isSelectionAvailable(catalog, requested)) return { selection: requested, note: '' }
+      return { selection: this.pickDefaultSelection(catalog).selection, note: `指定的 API ${requested.provider}/${requested.model} 不在当前模型目录，已回退默认` }
+    }
+    const saved = this.settings.model
+    if (saved.provider && saved.model) {
+      if (this.isSelectionAvailable(catalog, saved)) return { selection: { ...saved }, note: '' }
+      const fb = this.pickDefaultSelection(catalog)
+      return { selection: fb.selection, note: `配置的 API ${saved.provider}/${saved.model} 当前不可用（已下线或移除），已回退默认${fb.selection ? `：${fb.selection.provider}/${fb.selection.model}` : ''}` }
+    }
+    return this.pickDefaultSelection(catalog)
+  }
+
   async translate(input) {
     const pdfPath = await this.resolvePdf(input.path)
     const sessionController = this.ctx.get('sessionController')
     if (sessionController?.create === undefined) throw new Error('sessionController is not available in this host')
     const outputDir = await this.ensureOutputDir()
+    const { selection, note } = await this.resolveModelSelection(input.model)
     const cwd = input.workspace && isAbsolute(input.workspace)
       ? resolve(input.workspace)
       : (outputDir || dirname(pdfPath))
@@ -541,6 +617,9 @@ class Pdf2Zh {
       sessionId: '',
       cwd,
       outputDir,
+      provider: selection?.provider ?? '',
+      model: selection?.model ?? '',
+      modelNote: note,
       pages: input.pages ?? '',
       bilingual: input.bilingual === true,
       appendix: input.appendix === true,
@@ -569,6 +648,13 @@ class Pdf2Zh {
     try {
       await sessionController.rename({ sessionId: created.sessionId, title })
     } catch { /* cosmetic only */ }
+    if (selection !== null && typeof sessionController.selectModel === 'function') {
+      try {
+        await sessionController.selectModel({ sessionId: created.sessionId, provider: selection.provider, model: selection.model })
+      } catch (error) {
+        job.modelNote = `选择 API ${selection.provider}/${selection.model} 失败，会话将用 host 默认模型：${error instanceof Error ? error.message : String(error)}`.slice(0, 300)
+      }
+    }
     const options = []
     if (input.pages) options.push(`只翻 ${input.pages} 页`)
     if (input.bilingual) options.push('中英对照')
@@ -597,7 +683,7 @@ class Pdf2Zh {
       throw new Error(job.error)
     }
     this.addJob(job)
-    return { sessionId: created.sessionId, cwd, title, jobId: job.id }
+    return { sessionId: created.sessionId, cwd, title, jobId: job.id, provider: job.provider, model: job.model, modelNote: job.modelNote }
   }
 
   readBody(req) {
@@ -753,6 +839,25 @@ class Pdf2Zh {
         this.sendJson(res, 200, { ok: true, ...this.settings })
         return
       }
+      if (req.method === 'GET' && sub === '/models') {
+        const catalog = await this.modelCatalogSafe()
+        if (catalog === null) throw new Error('无法读取模型目录（host 未提供 modelCatalog）')
+        const routable = Array.isArray(catalog.routableProviders) ? catalog.routableProviders : []
+        this.sendJson(res, 200, {
+          ok: true,
+          default: catalog.default ?? null,
+          saved: { ...this.settings.model },
+          auto: this.pickDefaultSelection(catalog).selection,
+          providers: (catalog.groups ?? []).map((g) => ({
+            id: g.id,
+            name: g.name ?? g.id,
+            routable: routable.length === 0 || routable.includes(g.id),
+            models: (g.models ?? []).map((m) => ({ id: m.id, name: m.name ?? m.id, description: m.description ?? '' })),
+          })),
+          failures: catalog.failures ?? [],
+        })
+        return
+      }
       if (req.method === 'POST' && sub === '/settings') {
         const body = await this.readBody(req)
         this.sendJson(res, 200, { ok: true, ...(await this.updateSettings(body)) })
@@ -795,6 +900,9 @@ class Pdf2Zh {
           bilingual: body.bilingual === true,
           appendix: body.appendix === true,
           sourceChars: body.sourceChars,
+          model: body.model && typeof body.model === 'object'
+            ? { provider: String(body.model.provider ?? '').trim(), model: String(body.model.model ?? '').trim() }
+            : undefined,
           workspace: typeof body.workspace === 'string' && isAbsolute(body.workspace) ? body.workspace : undefined,
         })
         this.sendJson(res, 200, { ok: true, ...result })
