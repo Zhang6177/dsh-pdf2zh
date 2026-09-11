@@ -1,7 +1,7 @@
 {
   "name": "dsh-pdf2zh",
-  "version": "0.2.1",
-  "description": "学术论文 PDF 英转中 dsh 插件：自动安装/同步 pdf2zh 技能，提供 PDF 文本提取 API 与一键开转会话翻译。",
+  "version": "0.3.0",
+  "description": "学术论文 PDF 英转中 dsh 插件：自动安装/同步 pdf2zh 技能，提供 PDF 文本提取 API 与一键开转会话翻译；带翻译看板（进行中/已完成/已失败 + 进度条）与译文保存路径设置。",
   "author": "Zhang Qinhan",
   "type": "module",
   "main": "./src/index.js",

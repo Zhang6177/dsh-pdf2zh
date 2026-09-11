@@ -30,7 +30,9 @@ python3 ~/.dsh/skills/pdf2zh/extract.py <pdf> [--pages 1-8]
 读完整份提取文本（一般 5-15k token，一次读完），定位：标题 / 作者 / 会议 / 摘要 / 各编号章节 / 图表标题 / 参考文献 / 附录。
 **跳过封面页**：从 ResearchGate/Scilit 等网站下载的 PDF 第一页常是站点封面（"See discussions, stats..."、"Article in ..."、"CITATIONS/READS" 等字样），这不是论文内容，直接跳过，从出现真正标题+摘要的那页开始。
 
-### 3. 逐节翻译，写入 `<同目录>/<stem>.zh.md`
+### 3. 逐节翻译，写入 `<stem>.zh.md`
+
+**输出目录**：若任务说明里指定了保存目录（如插件面板设置的「保存路径」），`.zh.md`、`.en-zh.md` 与提取的 `.txt` 全部写入该目录；未指定时写到源 PDF 同目录。
 
 第一节约束用 `write` 建文件，后续节用 `edit` 追加。逐节完成，不要试图一次生成全文。
 
