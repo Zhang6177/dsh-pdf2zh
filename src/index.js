@@ -17,6 +17,9 @@
  *       GET  /settings      — current UI settings (output dir / timeout / model)
  *       POST /settings      — persist UI settings (~/.dsh/pdf2zh/settings.json)
  *       GET  /models        — the dsh LLM registry (providers/models + auto pick)
+ *       POST /models/discover — probe an endpoint's model list (draft key, never stored)
+ *       POST /models/add    — register a new provider into dsh settings (hot)
+ *       POST /models/remove — delete a user-added provider profile
  *       GET  /jobs          — translation job board (statuses + progress)
  *       POST /jobs/delete   — remove one job from the board
  *       POST /jobs/clear    — remove all finished (done/failed) jobs
@@ -61,6 +64,10 @@ const MAX_TIMEOUT_MINUTES = 1440
 const MAX_JOBS = 200
 /** Chinese bytes per source char in a .zh.md output — rough but monotone, only used for the progress bar. */
 const ZH_BYTES_PER_SRC_CHAR = 1.4
+/** dsh settings namespace owning LLM provider profiles (the Models settings page writes it too). */
+const LLM_SETTINGS_NS = 'llm-pi-ai'
+const ADDABLE_APIS = new Set(['openai-completions', 'anthropic-messages', 'openai-responses'])
+const PROVIDER_ID = /^[a-z][a-z0-9_-]{1,40}$/
 const VERSION = (() => {
   try { return require('../package.json').version } catch { return '0.0.0' }
 })()
@@ -599,6 +606,171 @@ class Pdf2Zh {
     return this.pickDefaultSelection(catalog)
   }
 
+  /* ---------------- provider management (add/remove/discover via dsh seams) ---------------- */
+
+  settingsService() {
+    const settings = this.ctx.get('settings')
+    if (settings?.mutate === undefined || settings?.describe === undefined) {
+      throw new Error('host 未提供 settings 服务（无法管理模型配置）')
+    }
+    return settings
+  }
+
+  hasSettingsService() {
+    try {
+      const settings = this.ctx.get('settings')
+      return settings?.mutate !== undefined && settings?.describe !== undefined
+    } catch {
+      return false
+    }
+  }
+
+  /** The live `llm-pi-ai` namespace view (value + user layer + revision + applies). */
+  findLlmView(settings) {
+    try {
+      const described = settings.describe({ redactSecrets: true })
+      const list = Array.isArray(described) ? described : (Array.isArray(described?.namespaces) ? described.namespaces : [])
+      return list.find((entry) => entry?.ns === LLM_SETTINGS_NS) ?? null
+    } catch {
+      return null
+    }
+  }
+
+  /** CAS write into llm-pi-ai.providers with re-read retries on revision conflict. */
+  async mutateLlmSection(ops) {
+    const settings = this.settingsService()
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const view = this.findLlmView(settings)
+      if (view == null) throw new Error(`未找到 ${LLM_SETTINGS_NS} 设置命名空间`)
+      try {
+        return await settings.mutate(LLM_SETTINGS_NS, ops, view.revision)
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error)
+        if ((typeof error?.code === 'string' && /conflict/i.test(error.code)) || /conflict|revision/i.test(text)) continue
+        throw error
+      }
+    }
+    throw new Error('settings 版本冲突（有并发修改），请重试')
+  }
+
+  /** User-layer provider profiles — the ones settings.yaml-level additions (deletable here). */
+  userProviderProfiles() {
+    try {
+      const view = this.findLlmView(this.settingsService())
+      const user = view?.user?.providers ?? {}
+      return user && typeof user === 'object' ? user : {}
+    } catch {
+      return {}
+    }
+  }
+
+  async waitForProviderRoute(provider, attempts = 12, delayMs = 400) {
+    for (let i = 0; i < attempts; i += 1) {
+      const catalog = await this.modelCatalogSafe()
+      if (catalog?.groups?.some((g) => g.id === provider)) return true
+      await new Promise((ok) => setTimeout(ok, delayMs))
+    }
+    return false
+  }
+
+  /** Probe a model endpoint without storing anything (draft discovery). */
+  async discoverModels(body) {
+    const baseURL = String(body.baseURL ?? '').trim()
+    let url
+    try { url = new URL(baseURL) } catch { throw new Error('服务地址需为完整 URL，如 http://127.0.0.1:8000/v1') }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('服务地址需为 http(s) URL')
+    const api = typeof body.api === 'string' && ADDABLE_APIS.has(body.api.trim()) ? body.api.trim() : undefined
+    const apiKey = typeof body.apiKey === 'string' && body.apiKey.trim() !== '' ? body.apiKey.trim() : undefined
+    const provider = typeof body.provider === 'string' && PROVIDER_ID.test(body.provider.trim().toLowerCase()) ? body.provider.trim().toLowerCase() : undefined
+    const llm = this.ctx.get('llm')
+    if (typeof llm?.discoverModels !== 'function') throw new Error('host 未提供模型探测服务（llm.discoverModels）')
+    const models = await llm.discoverModels(
+      LLM_SETTINGS_NS,
+      { baseURL: url.toString(), ...(api ? { api } : {}), ...(apiKey ? { apiKey } : {}), ...(provider ? { provider } : {}) },
+      AbortSignal.timeout(20_000),
+    )
+    if (!Array.isArray(models)) return { ok: true, models: [] }
+    return {
+      ok: true,
+      models: models.slice(0, 100).map((m) => ({
+        id: String(m?.id ?? ''),
+        name: m?.name ? String(m.name) : String(m?.id ?? ''),
+        ...(Number.isFinite(m?.contextWindow) ? { contextWindow: Math.floor(m.contextWindow) } : {}),
+      })).filter((m) => m.id !== ''),
+    }
+  }
+
+  /** Register a new OpenAI/Anthropic-compatible provider into dsh settings (hot). */
+  async addModelProfile(body) {
+    const provider = String(body.provider ?? '').trim().toLowerCase()
+    if (!PROVIDER_ID.test(provider)) throw new Error('API 标识需为 2–41 位小写字母/数字/-/_，且以字母开头')
+    const displayName = String(body.displayName ?? '').trim() || provider
+    const api = String(body.api ?? 'openai-completions').trim()
+    if (!ADDABLE_APIS.has(api)) throw new Error(`协议需为 ${[...ADDABLE_APIS].join(' / ')}`)
+    const baseURL = String(body.baseURL ?? '').trim().replace(/\/+$/, '')
+    let url
+    try { url = new URL(baseURL) } catch { throw new Error('服务地址需为完整 URL，如 http://127.0.0.1:8000/v1') }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('服务地址需为 http(s) URL')
+    const rawModels = Array.isArray(body.models) ? body.models.slice(0, 50) : []
+    const models = []
+    for (const entry of rawModels) {
+      const id = String(typeof entry === 'string' ? entry : entry?.id ?? '').trim()
+      if (id === '' || models.some((m) => m.id === id)) continue
+      const model = { id }
+      const name = String(entry?.name ?? '').trim()
+      if (name !== '' && name !== id) model.name = name
+      const cw = Number(entry?.contextWindow)
+      if (Number.isFinite(cw) && cw >= 1024) model.contextWindow = Math.floor(cw)
+      models.push(model)
+    }
+    if (models.length === 0) throw new Error('至少需要一个模型 id（点「获取模型」或每行一个手动填写）')
+    if (this.userProviderProfiles()[provider] !== undefined) {
+      throw new Error(`API 标识 "${provider}" 已存在（请先在卡片上删除，或换一个标识）`)
+    }
+    const ref = `${provider.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`
+    const key = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
+    if (key !== '') {
+      const credentials = this.ctx.get('credentials')
+      if (typeof credentials?.set !== 'function') throw new Error('host 未提供 credentials 服务，无法保存 API Key')
+      await credentials.set(ref, key)
+    }
+    const profile = {
+      ...(key !== '' ? { apiKeyEnv: ref } : {}),
+      displayName,
+      api,
+      baseURL,
+      models,
+    }
+    try {
+      await this.mutateLlmSection([{ op: 'set', path: ['providers', provider], value: profile }])
+    } catch (error) {
+      if (key !== '') {
+        try { await this.ctx.get('credentials')?.unset?.(ref) } catch { /* best effort */ }
+      }
+      throw new Error(`写入模型配置失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    const live = await this.waitForProviderRoute(provider)
+    return { ok: true, provider, displayName, api, baseURL, models: models.map((m) => m.id), keyRef: key !== '' ? ref : '', live }
+  }
+
+  /** Remove a user-layer provider profile (and its derived credential when we own the name). */
+  async removeModelProfile(body) {
+    const provider = String(body.provider ?? '').trim().toLowerCase()
+    if (!PROVIDER_ID.test(provider)) throw new Error('非法的 API 标识')
+    const existing = this.userProviderProfiles()[provider]
+    if (existing === undefined) throw new Error(`"${provider}" 不在用户设置层，无法从这里删除`)
+    await this.mutateLlmSection([{ op: 'unset', path: ['providers', provider] }])
+    let keyRemoved = false
+    const ref = typeof existing?.apiKeyEnv === 'string' ? existing.apiKeyEnv : ''
+    if (ref !== '' && ref === `${provider.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`) {
+      try {
+        await this.ctx.get('credentials')?.unset?.(ref)
+        keyRemoved = true
+      } catch { /* profile is gone; key removal is cosmetic */ }
+    }
+    return { ok: true, provider, keyRemoved }
+  }
+
   async translate(input) {
     const pdfPath = await this.resolvePdf(input.path)
     const sessionController = this.ctx.get('sessionController')
@@ -843,8 +1015,11 @@ class Pdf2Zh {
         const catalog = await this.modelCatalogSafe()
         if (catalog === null) throw new Error('无法读取模型目录（host 未提供 modelCatalog）')
         const routable = Array.isArray(catalog.routableProviders) ? catalog.routableProviders : []
+        let userAdded = {}
+        try { userAdded = this.userProviderProfiles() } catch { /* management hidden, listing still works */ }
         this.sendJson(res, 200, {
           ok: true,
+          canManage: this.hasSettingsService(),
           default: catalog.default ?? null,
           saved: { ...this.settings.model },
           auto: this.pickDefaultSelection(catalog).selection,
@@ -852,10 +1027,29 @@ class Pdf2Zh {
             id: g.id,
             name: g.name ?? g.id,
             routable: routable.length === 0 || routable.includes(g.id),
+            userAdded: userAdded[g.id] !== undefined,
+            base: typeof userAdded[g.id]?.baseURL === 'string' ? userAdded[g.id].baseURL : '',
+            protocol: typeof userAdded[g.id]?.api === 'string' ? userAdded[g.id].api : '',
+            hasKey: typeof userAdded[g.id]?.apiKeyEnv === 'string' && userAdded[g.id].apiKeyEnv !== '',
             models: (g.models ?? []).map((m) => ({ id: m.id, name: m.name ?? m.id, description: m.description ?? '' })),
           })),
           failures: catalog.failures ?? [],
         })
+        return
+      }
+      if (req.method === 'POST' && sub === '/models/discover') {
+        const body = await this.readBody(req)
+        this.sendJson(res, 200, await this.discoverModels(body))
+        return
+      }
+      if (req.method === 'POST' && sub === '/models/add') {
+        const body = await this.readBody(req)
+        this.sendJson(res, 200, await this.addModelProfile(body))
+        return
+      }
+      if (req.method === 'POST' && sub === '/models/remove') {
+        const body = await this.readBody(req)
+        this.sendJson(res, 200, await this.removeModelProfile(body))
         return
       }
       if (req.method === 'POST' && sub === '/settings') {
