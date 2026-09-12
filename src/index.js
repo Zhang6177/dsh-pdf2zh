@@ -12,30 +12,34 @@
  *       GET  /glossary      — current glossary text
  *       POST /glossary      — save edited glossary text
  *       POST /extract       — run the PyMuPDF extractor on a server-side PDF path
- *       POST /translate     — open a fresh session, queue the pdf2zh prompt, record a job
+ *       POST /translate     — spawn the structured fast pipeline (detached python), record a job
  *       POST /upload        — drag-drop PDF upload (raw body, filename in x-pdf2zh-filename)
- *       GET  /settings      — current UI settings (output dir / timeout / model)
+ *       GET  /settings      — current UI settings (output dir / timeout / model / concurrency)
  *       POST /settings      — persist UI settings (~/.dsh/pdf2zh/settings.json)
  *       GET  /models        — the dsh LLM registry (providers/models + auto pick)
  *       POST /models/discover — probe an endpoint's model list (draft key, never stored)
  *       POST /models/add    — register a new provider into dsh settings (hot)
  *       POST /models/remove — delete a user-added provider profile
  *       GET  /jobs          — translation job board (statuses + progress)
- *       POST /jobs/delete   — remove one job from the board
- *       POST /jobs/retry    — re-dispatch a finished/failed job (new session, replaces the card)
+ *       GET  /file          — serve a produced file (whitelisted job outputs)
+ *       POST /jobs/delete   — remove one job from the board (kills its pipeline if running)
+ *       POST /jobs/retry    — re-dispatch a finished/failed job (new pipeline, replaces the card)
  *       POST /jobs/clear    — remove all finished (done/failed) jobs
- *  3. Watch every running translation job through the host session APIs
- *     (sessionController.list polling + sessionQuery turn/end evidence),
+ *  3. Watch every running job through its pipeline progress file
+ *     (<DSH home>/pdf2zh/jobs/<id>.json: stage + paragraph counters),
  *     persisting the board ledger to ~/.dsh/pdf2zh/jobs.json.
  *
- * Translation itself is done by the session model driven by the skill; this
- * plugin syncs the skill, extracts text, dispatches sessions, and tracks
- * their progress. No external services, no new runtime dependencies.
+ * v0.8: translation is no longer done inside a DSH session. The host spawns
+ * `pipeline/run_pipeline.py` (PyMuPDF layout extraction → batched paragraph
+ * translation against the selected OpenAI/Anthropic-compatible endpoint with
+ * thinking disabled and N-way concurrency → layout-faithful Chinese PDF).
+ * Deterministic work stays deterministic; the LLM only translates text.
  */
 
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { copyFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { closeSync, createReadStream, openSync } from 'node:fs'
+import { copyFile, mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { createRequire } from 'node:module'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
@@ -43,10 +47,11 @@ import { fileURLToPath } from 'node:url'
 import z from 'schemastery'
 
 export const name = 'pdf2zh'
-export const inject = ['webServer', 'sessionController', 'sessionQuery']
+export const inject = ['webServer', 'sessionController']
 
 const require = createRequire(import.meta.url)
 const PKG_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const PIPELINE_DIR = join(PKG_ROOT, 'pipeline')
 const SKILL_SRC_DIR = join(PKG_ROOT, 'skill')
 /** Managed on every boot: overwritten when the bundled version differs. */
 const MANAGED_SKILL_FILES = ['SKILL.md', 'extract.py']
@@ -57,14 +62,16 @@ const MAX_PREVIEW_CHARS = 1200
 const MAX_BODY_BYTES = 64 * 1024
 /** extract.py page spec: "1-8" / "1,3,5-9" — kept deliberately permissive, the script validates. */
 const PAGES_SPEC = /^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$/
-/** Board watcher cadence and how long we tolerate a session that never starts a turn. */
+/** Board watcher cadence and how long we wait for a spawned pipeline to announce itself. */
 const POLL_INTERVAL_MS = 10_000
-const TURN_START_GRACE_MS = 180_000
+const PIPELINE_START_GRACE_MS = 120_000
+/** A progress file older than this with a dead pid means the pipeline died mid-run. */
+const PIPELINE_STALE_MS = 60_000
 const DEFAULT_TIMEOUT_MINUTES = 240
 const MAX_TIMEOUT_MINUTES = 1440
+const DEFAULT_CONCURRENCY = 8
+const MAX_CONCURRENCY = 16
 const MAX_JOBS = 200
-/** Chinese bytes per source char in a .zh.md output — rough but monotone, only used for the progress bar. */
-const ZH_BYTES_PER_SRC_CHAR = 1.4
 /** dsh settings namespace owning LLM provider profiles (the Models settings page writes it too). */
 const LLM_SETTINGS_NS = 'llm-pi-ai'
 const ADDABLE_APIS = new Set(['openai-completions', 'anthropic-messages', 'openai-responses'])
@@ -102,16 +109,20 @@ class Pdf2Zh {
     this.dataDir = join(dshHome(), 'pdf2zh')
     this.settingsPath = join(this.dataDir, 'settings.json')
     this.jobsPath = join(this.dataDir, 'jobs.json')
+    this.jobsDir = join(this.dataDir, 'jobs')
     this.settings = {
       outputDir: typeof config.outputDir === 'string' ? config.outputDir : '',
       timeoutMinutes: clampTimeout(config.timeoutMinutes),
       model: { provider: '', model: '' },
+      concurrency: DEFAULT_CONCURRENCY,
     }
     this.jobs = []
+    this.children = new Map()
     this.jobsLoaded = false
     this.processStartedAt = Date.now()
     this.skill = { dir: this.config.skillDir, synced: false, files: [] }
     this.pymupdf = { checked: false, available: false, version: '' }
+    this.requests = { available: false }
     this.polling = false
   }
 
@@ -172,6 +183,12 @@ class Pdf2Zh {
     } catch {
       this.pymupdf = { checked: true, available: false, version: '' }
     }
+    try {
+      await this.runPython(['-c', 'import requests'], 15_000)
+      this.requests = { available: true }
+    } catch {
+      this.requests = { available: false }
+    }
   }
 
   runPython(args, timeoutMs) {
@@ -217,6 +234,9 @@ class Pdf2Zh {
       if (typeof raw.timeoutMinutes === 'number') {
         this.settings.timeoutMinutes = clampTimeout(raw.timeoutMinutes)
       }
+      if (typeof raw.concurrency === 'number') {
+        this.settings.concurrency = clampConcurrency(raw.concurrency)
+      }
       if (raw.model && typeof raw.model === 'object') {
         const provider = typeof raw.model.provider === 'string' ? raw.model.provider.trim() : ''
         const model = typeof raw.model.model === 'string' ? raw.model.model.trim() : ''
@@ -231,6 +251,7 @@ class Pdf2Zh {
       outputDir: this.settings.outputDir,
       timeoutMinutes: this.settings.timeoutMinutes,
       model: this.settings.model,
+      concurrency: this.settings.concurrency,
     }, null, 2), { mode: 0o644 })
   }
 
@@ -253,6 +274,9 @@ class Pdf2Zh {
     }
     if (patch.timeoutMinutes !== undefined) {
       next.timeoutMinutes = clampTimeout(patch.timeoutMinutes)
+    }
+    if (patch.concurrency !== undefined) {
+      next.concurrency = clampConcurrency(patch.concurrency)
     }
     if (patch.model !== undefined) {
       const raw = patch.model
@@ -314,7 +338,7 @@ class Pdf2Zh {
     if (job.outputDir) dirs.push(job.outputDir)
     const pdfDir = dirname(job.pdfPath)
     if (!dirs.includes(pdfDir)) dirs.push(pdfDir)
-    const names = [`${stem}.zh.md`]
+    const names = [`${stem}.zh.pdf`, `${stem}.zh.md`]
     if (job.bilingual) names.push(`${stem}.en-zh.md`)
     return { stem, dirs, names }
   }
@@ -331,20 +355,18 @@ class Pdf2Zh {
     return null
   }
 
-  /** 0..1 progress estimate: output-file growth, or an elapsed-time asymptote. */
+  /**
+   * 0..1 progress. The pipeline publishes real paragraph counts; before its
+   * first write we creep so a launched card never looks frozen.
+   */
   async progressFor(job, now = Date.now()) {
     if (job.status === 'done') return 1
     if (job.status === 'failed') return typeof job.progress === 'number' ? job.progress : 0
-    const located = await this.locateOutput(job, `${this.jobViewPaths(job).stem}.zh.md`)
-    if (located !== null) {
-      if (job.sourceChars > 0) {
-        const expected = Math.max(4096, Math.round(job.sourceChars * ZH_BYTES_PER_SRC_CHAR))
-        return Math.min(0.99, Math.max(0.03, located.bytes / expected))
-      }
-      return Math.min(0.92, Math.max(0.05, 0.25 + located.bytes / 150_000))
+    if (typeof job.progress === 'number' && job.progress > 0) {
+      return Math.min(0.98, job.progress)
     }
     const elapsed = Math.max(0, now - job.createdAt)
-    return Math.min(0.9, Math.max(0.02, 1 - Math.exp(-elapsed / 900_000)))
+    return Math.min(0.15, Math.max(0.02, elapsed / 120_000))
   }
 
   /** Board payload: every job with its live progress + summary counts. */
@@ -365,10 +387,47 @@ class Pdf2Zh {
     return { ok: true, jobs, summary, settings: { ...this.settings } }
   }
 
-  /* ---------------- board watcher (session evidence) ---------------- */
+  /* ---------------- board watcher (pipeline progress files) ---------------- */
 
   startWatcher() {
     setInterval(() => { void this.pollWatchers() }, POLL_INTERVAL_MS).unref?.()
+  }
+
+  jobProgressPath(job) {
+    return join(this.jobsDir, `${job.id}.json`)
+  }
+
+  jobLogPath(job) {
+    return join(this.jobsDir, `${job.id}.log`)
+  }
+
+  async readProgress(job) {
+    try {
+      const parsed = JSON.parse(await readFile(this.jobProgressPath(job), 'utf8'))
+      return parsed && typeof parsed === 'object' ? parsed : null
+    } catch {
+      return null
+    }
+  }
+
+  static pidAlive(pid) {
+    if (!Number.isFinite(pid) || pid <= 0) return false
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      return error?.code === 'EPERM'
+    }
+  }
+
+  killPipeline(job) {
+    const pid = Number(job.childPid) || 0
+    if (pid <= 0) return
+    try {
+      process.kill(-pid, 'SIGKILL') // detached child is its own process-group leader
+    } catch {
+      try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+    }
   }
 
   async pollWatchers() {
@@ -377,51 +436,53 @@ class Pdf2Zh {
     if (running.length === 0) return
     this.polling = true
     try {
-      const sessionController = this.ctx.get('sessionController')
-      let items
-      try {
-        const listValue = await sessionController?.list?.({}, AbortSignal.timeout(10_000))
-        items = listValue?.items
-      } catch { return }
-      if (!Array.isArray(items)) return
       const now = Date.now()
       let dirty = false
       for (const job of running) {
         if (now >= (job.timeoutAt ?? job.createdAt + this.settings.timeoutMinutes * 60_000)) {
           const minutes = Math.max(1, Math.round(((job.timeoutAt ?? now) - job.createdAt) / 60_000))
-          void this.cancelSession(job.sessionId)
-          await this.settleJob(job, 'failed', `翻译超时（超过 ${minutes} 分钟），已尝试终止会话`, now)
+          this.killPipeline(job)
+          await this.settleJob(job, 'failed', `翻译超时（超过 ${minutes} 分钟），已终止翻译进程`, now)
           dirty = true
           continue
         }
-        const summary = items.find((i) => i?.sessionId === job.sessionId)
-        if (summary?.running) {
-          if (!job.sawRunning) { job.sawRunning = true; dirty = true }
+        const prog = await this.readProgress(job)
+        if (prog === null) {
+          // The child never announced itself: spawn failed or python is missing.
+          if (now - Math.max(job.createdAt, this.processStartedAt) > PIPELINE_START_GRACE_MS) {
+            await this.settleJob(job, 'failed', `翻译进程未启动（检查 python3/PyMuPDF），日志：${this.jobLogPath(job)}`, now)
+            dirty = true
+          }
           continue
         }
-        if (summary !== undefined) {
-          const evidence = await this.turnEndEvidence(job)
-          if (evidence !== null) {
-            await this.settleJob(job, evidence.outcome, evidence.error, evidence.endedAt ?? now)
-            dirty = true
-            continue
+        if (prog.result && typeof prog.result === 'object') {
+          if (prog.result.ok === true) {
+            await this.settleJob(job, 'done', undefined, now, prog.result)
+          } else {
+            await this.settleJob(job, 'failed', String(prog.result.error ?? '翻译管线报错').slice(0, 300), now)
           }
-          if (summary.error) {
-            await this.settleJob(job, 'failed', String(summary.error).slice(0, 300), now)
-            dirty = true
-            continue
-          }
+          dirty = true
+          continue
         }
-        // Idle without turn evidence: a missing session is fatal after grace;
-        // anything else (never started / interrupted by a host restart) also
-        // fails once the grace window passes since creation *and* boot.
-        if (now - Math.max(job.createdAt, this.processStartedAt) > TURN_START_GRACE_MS) {
-          const reason = summary === undefined
-            ? '执行会话不存在（可能已被删除）'
-            : job.sawRunning
-              ? '会话已中断（未找到已完成的 turn 证据）'
-              : '会话未启动（宽限期内没有 turn 活动）'
-          await this.settleJob(job, 'failed', reason, now)
+        const stage = String(prog.stage ?? '')
+        const total = Number(prog.total) || 0
+        const done = Number(prog.done) || 0
+        let pct = job.progress ?? 0.02
+        if (stage === 'extract') pct = 0.03
+        else if (stage === 'translate' && total > 0) pct = 0.05 + 0.87 * Math.min(1, done / total)
+        else if (stage === 'render') pct = 0.95
+        if (typeof pct === 'number' && Math.abs(pct - (job.progress ?? 0)) >= 0.005) {
+          job.progress = pct
+          dirty = true
+        }
+        const phase = typeof prog.phase === 'string' ? prog.phase.slice(0, 60) : ''
+        if (phase && phase !== job.phase) {
+          job.phase = phase
+          dirty = true
+        }
+        if (!Pdf2Zh.pidAlive(Number(prog.pid)) && now - Number(prog.ts ?? 0) > PIPELINE_STALE_MS) {
+          this.killPipeline(job)
+          await this.settleJob(job, 'failed', `翻译进程中途退出（阶段：${phase || '未知'}），可点「重试」。日志：${this.jobLogPath(job)}`, now)
           dirty = true
         }
       }
@@ -432,76 +493,55 @@ class Pdf2Zh {
   }
 
   /**
-   * Read the last turn/end event for the job's session. Returns null when no
-   * *fresh* evidence exists (missing service, no events, or a pre-job event).
+   * Move a job out of 'running'. `result` is the pipeline's final block
+   * ({ok, outputs, stats, failedParagraphs, warnings}) when available.
    */
-  async turnEndEvidence(job) {
-    try {
-      const sessionQuery = this.ctx.get('sessionQuery')
-      if (typeof sessionQuery?.listEvents !== 'function') return null
-      const records = await sessionQuery.listEvents(job.sessionId)
-      if (!Array.isArray(records)) return null
-      for (let i = records.length - 1; i >= 0; i -= 1) {
-        const rec = records[i]
-        if (rec?.type !== 'turn/end') continue
-        if (typeof rec.time === 'number' && rec.time < job.createdAt - 5_000) return null
-        let outcome = 'done'
-        let error
-        let endedAt = typeof rec.time === 'number' ? rec.time : undefined
-        if (typeof sessionQuery.readEvent === 'function' && typeof rec.seq === 'number') {
-          try {
-            const window = await sessionQuery.readEvent({ sessionId: job.sessionId, seq: rec.seq })
-            const ev = window?.target ?? {}
-            const reason = ev?.data?.reason
-            if (reason?.kind === 'error') {
-              outcome = 'failed'
-              error = `turn 结束于错误：${String(reason.error?.code ?? 'unknown')} ${String(reason.error?.message ?? '')}`.trim()
-            }
-            if (typeof ev?.time === 'number') endedAt = ev.time
-          } catch { /* keep the index-level evidence */ }
-        }
-        return { outcome, error, endedAt }
-      }
-      return null
-    } catch {
-      return null
-    }
-  }
-
-  async cancelSession(sessionId) {
-    try {
-      const sessionController = this.ctx.get('sessionController')
-      await sessionController?.cancel?.({ sessionId })
-    } catch { /* best effort */ }
-  }
-
-  /** Move a job out of 'running': persist the outcome and collect outputs. */
-  async settleJob(job, outcome, error, endedAt) {
+  async settleJob(job, outcome, error, endedAt, result) {
     job.status = outcome
     job.endedAt = endedAt ?? Date.now()
-    job.progress = await this.progressFor(job, job.endedAt)
-    if (outcome === 'done') job.progress = 1
+    if (result?.stats) job.stats = result.stats
+    if (Number(result?.failedParagraphs) > 0) job.failedParagraphs = Number(result.failedParagraphs)
+    if (Array.isArray(result?.warnings) && result.warnings.length > 0) {
+      job.renderWarnings = result.warnings.slice(0, 3)
+    }
+    job.progress = outcome === 'done' ? 1 : (typeof job.progress === 'number' ? job.progress : 0)
     if (error) job.error = String(error).slice(0, 300)
     if (outcome === 'done') {
-      const outputs = await this.collectOutputs(job)
-      job.outputPaths = outputs.paths
-      if (!outputs.foundZh) job.note = '未在输出目录找到 .zh.md 译文文件（会话可能把文件写到了别处）'
-      else delete job.note
+      const listed = Array.isArray(result?.outputs) ? result.outputs.filter((p) => typeof p === 'string') : []
+      const existing = []
+      for (const p of listed) {
+        try {
+          const st = await stat(p)
+          if (st.isFile()) existing.push(p)
+        } catch { /* ignore stale entries */ }
+      }
+      if (existing.length > 0) {
+        job.outputPaths = existing
+        delete job.note
+      } else {
+        const collected = await this.collectOutputs(job)
+        job.outputPaths = collected.paths
+        if (!collected.foundAny) job.note = '未在输出目录找到译文文件（可查看管线日志）'
+        else delete job.note
+      }
+      if (job.failedParagraphs > 0) {
+        job.note = `${job.failedParagraphs} 段翻译失败（对应位置以原文/[翻译失败] 占位）`
+      }
     }
+    this.children.delete(job.id)
   }
 
   /**
-   * Locate the produced .zh.md / .en-zh.md. When a save dir is configured but
-   * the session wrote next to the source PDF anyway, copy the files over as a
-   * fallback so "saved to the chosen location" always holds.
+   * Fallback locator (progress file lost / outputs moved): find the produced
+   * files next to the source PDF and copy them into the configured dir.
    */
   async collectOutputs(job) {
     const paths = []
-    let foundZh = false
+    let foundAny = false
     for (const name of this.jobViewPaths(job).names) {
       const found = await this.locateOutput(job, name)
       if (found === null) continue
-      if (name.endsWith('.zh.md') && !name.endsWith('.en-zh.md')) foundZh = true
+      foundAny = true
       let path = found.path
       if (job.outputDir && dirname(path) !== job.outputDir) {
         const target = join(job.outputDir, name)
@@ -517,7 +557,7 @@ class Pdf2Zh {
       }
       paths.push(path)
     }
-    return { paths, foundZh }
+    return { paths, foundAny }
   }
 
   /* ---------------- translation dispatch ---------------- */
@@ -580,7 +620,7 @@ class Pdf2Zh {
 
   /** Automatic default: prefer a locally deployed provider, else the host default. */
   pickDefaultSelection(catalog) {
-    if (catalog == null) return { selection: null, note: '模型目录不可用，会话将使用 host 默认模型' }
+    if (catalog == null) return { selection: null, note: '模型目录不可用，无法确定翻译端点' }
     const groups = this.catalogGroups(catalog)
     const local = groups.find((g) => /local|self|vllm|ollama|本地/i.test(`${g.id} ${g.name ?? ''}`))
     if (local !== undefined) return { selection: { provider: local.id, model: local.models[0].id }, note: '' }
@@ -588,7 +628,7 @@ class Pdf2Zh {
       return { selection: { provider: catalog.default.provider, model: catalog.default.model }, note: '' }
     }
     if (groups.length > 0) return { selection: { provider: groups[0].id, model: groups[0].models[0].id }, note: '' }
-    return { selection: null, note: '模型目录为空，会话将使用 host 默认模型' }
+    return { selection: null, note: '模型目录为空，无法确定翻译端点' }
   }
 
   /** explicit body override > saved setting > auto (local-first) default. */
@@ -630,13 +670,46 @@ class Pdf2Zh {
     if (uniq.length > 0) {
       return { selection: uniq[0], note: `候选 API 均不可达${skipped.length > 0 ? `（${skipped.join('、')}）` : ''}，翻译可能失败 — 请启动模型服务或在设置中更换 API 后「重试」`, explicit: false }
     }
-    return { selection: null, note: '模型目录为空，会话将使用 host 默认模型', explicit: false }
+    return { selection: null, note: '模型目录为空，无法确定翻译端点', explicit: false }
   }
 
-  /** Base URL a provider profile publishes (user settings layer), or ''. */
+  /**
+   * Provider profile: user settings layer first, then the merged effective
+   * value (covers providers defined outside the user layer). Null if absent.
+   */
+  providerProfile(provider) {
+    const user = this.userProviderProfiles()[provider]
+    if (user !== undefined && user !== null) return user
+    try {
+      const view = this.findLlmView(this.settingsService())
+      const merged = view?.value?.providers ?? {}
+      const prof = merged[provider]
+      return prof && typeof prof === 'object' ? prof : null
+    } catch {
+      return null
+    }
+  }
+
+  /** Base URL a provider profile publishes, or ''. */
   providerBase(provider) {
-    const prof = this.userProviderProfiles()[provider]
+    const prof = this.providerProfile(provider)
     return typeof prof?.baseURL === 'string' ? prof.baseURL : ''
+  }
+
+  /**
+   * Plaintext API key for a credential ref: host env → dsh credentials file
+   * (`refs:` block). Best-effort; '' means "send unauthenticated".
+   */
+  async resolveApiKey(ref) {
+    if (typeof ref !== 'string' || ref === '' || !/^[A-Z0-9_]+$/.test(ref)) return ''
+    const fromEnv = process.env[ref]
+    if (typeof fromEnv === 'string' && fromEnv !== '') return fromEnv
+    try {
+      const raw = await readFile(join(dshHome(), '.credentials.yaml'), 'utf8')
+      const m = new RegExp(`^\\s*${ref}\\s*:\\s*(\\S.*)$`, 'm').exec(raw)
+      if (m) return m[1].trim().replace(/^["'](.*)["']$/, '$1')
+    } catch { /* credentials file unreadable */ }
+    return ''
   }
 
   /**
@@ -827,21 +900,16 @@ class Pdf2Zh {
 
   async translate(input) {
     const pdfPath = await this.resolvePdf(input.path)
-    const sessionController = this.ctx.get('sessionController')
-    if (sessionController?.create === undefined) throw new Error('sessionController is not available in this host')
     const outputDir = await this.ensureOutputDir()
-    const { selection, note, explicit } = await this.resolveModelSelection(input.model)
-    const cwd = input.workspace && isAbsolute(input.workspace)
-      ? resolve(input.workspace)
-      : (outputDir || dirname(pdfPath))
+    const outDir = outputDir || dirname(pdfPath)
+    const { selection, note } = await this.resolveModelSelection(input.model)
     const title = `[pdf2zh] ${basename(pdfPath)}`
     const job = {
       id: randomUUID(),
       pdfPath,
       pdfName: basename(pdfPath),
       title,
-      sessionId: '',
-      cwd,
+      cwd: outDir,
       outputDir,
       provider: selection?.provider ?? '',
       model: selection?.model ?? '',
@@ -854,77 +922,88 @@ class Pdf2Zh {
       createdAt: Date.now(),
       endedAt: undefined,
       error: undefined,
-      progress: 0,
-      sawRunning: false,
+      progress: 0.02,
+      phase: '排队中',
       outputPaths: [],
+      childPid: 0,
       timeoutAt: Date.now() + this.settings.timeoutMinutes * 60_000,
     }
-    // Explicit choice (dialog default saved earlier): a dead endpoint fails fast
-    // with an actionable reason + a board job to retry, instead of a doomed session.
-    if (selection !== null && explicit) {
-      const base = this.providerBase(selection.provider)
-      if (base !== '') {
-        const probe = await this.probeBaseUrl(base)
-        if (!probe.ok) {
-          job.status = 'failed'
-          job.endedAt = Date.now()
-          job.error = `API ${selection.provider} 不可达（${base}${probe.timedOut ? '，连接超时' : '，连接被拒绝'}）：请启动模型服务，或在设置弹窗换用其它 API 后点「重试」`.slice(0, 300)
-          this.addJob(job)
-          throw new Error(job.error)
-        }
-      }
-    }
-    let created
-    try {
-      created = await sessionController.create({ cwd })
-      if (created?.sessionId === undefined) throw new Error('sessionController.create returned no sessionId')
-      job.sessionId = String(created.sessionId)
-    } catch (error) {
+    const failFast = (message) => {
       job.status = 'failed'
       job.endedAt = Date.now()
-      job.error = `创建会话失败：${error instanceof Error ? error.message : String(error)}`.slice(0, 300)
+      job.error = String(message).slice(0, 300)
       this.addJob(job)
       throw new Error(job.error)
     }
-    try {
-      await sessionController.rename({ sessionId: created.sessionId, title })
-    } catch { /* cosmetic only */ }
-    if (selection !== null && typeof sessionController.selectModel === 'function') {
-      try {
-        await sessionController.selectModel({ sessionId: created.sessionId, provider: selection.provider, model: selection.model })
-      } catch (error) {
-        job.modelNote = `选择 API ${selection.provider}/${selection.model} 失败，会话将用 host 默认模型：${error instanceof Error ? error.message : String(error)}`.slice(0, 300)
-      }
+    // The pipeline talks to one concrete endpoint: resolve it or fail loudly.
+    if (selection === null) {
+      failFast('无法确定翻译端点（模型目录不可用）：请在「⚙ 设置 → 模型 API」选择一个 API 后重试')
     }
-    const options = []
-    if (input.pages) options.push(`只翻 ${input.pages} 页`)
-    if (input.bilingual) options.push('中英对照')
-    if (input.appendix) options.push('含附录')
-    if (outputDir) options.push(`所有产出文件保存到目录 ${outputDir}`)
-    const text = [
-      `请使用 pdf2zh 技能把这篇论文翻译成中文：${pdfPath}`,
-      options.length ? `要求：${options.join('，')}。` : '',
-      outputDir
-        ? `输出路径：把 <同名>.zh.md${input.bilingual ? '、<同名>.en-zh.md' : ''} 和提取的 .txt 都保存到 ${outputDir}（本会话工作区），不要写回源 PDF 所在目录。`
-        : '',
-      '按技能流程执行：先运行提取脚本并抽查文本质量，再逐节翻译写入 <同名>.zh.md，最后汇报输出文件路径与本次新增术语。',
-    ].filter(Boolean).join('\n')
+    const profile = this.providerProfile(job.provider)
+    const baseURL = typeof profile?.baseURL === 'string' ? profile.baseURL.trim() : ''
+    if (baseURL === '') {
+      failFast(`API ${job.provider} 未显式配置 baseURL，快速管线需要 OpenAI/Anthropic 兼容端点：请在设置中换用其它 API`)
+    }
+    const probe = await this.probeBaseUrl(baseURL)
+    if (!probe.ok) {
+      failFast(`API ${job.provider} 不可达（${baseURL}${probe.timedOut ? '，连接超时' : '，连接被拒绝'}）：请启动模型服务，或在设置弹窗换用其它 API 后点「重试」`)
+    }
     try {
-      await sessionController.prompt({
-        sessionId: created.sessionId,
-        requestId: randomUUID(),
-        mode: 'queue',
-        content: [{ type: 'text', text }],
-      }, AbortSignal.timeout(30_000))
+      await mkdir(this.jobsDir, { recursive: true })
+      job.progressPath = this.jobProgressPath(job)
+      job.logPath = this.jobLogPath(job)
+      let fd = 'ignore'
+      try { fd = openSync(job.logPath, 'a') } catch { /* log file optional */ }
+      const child = spawn(this.config.python, [join(PIPELINE_DIR, 'run_pipeline.py')], {
+        cwd: outDir,
+        // detached = new process group: survives a dsh-web restart, and the
+        // board re-adopts it through the progress file (pid + stage).
+        detached: true,
+        stdio: ['ignore', fd, fd],
+        env: {
+          PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+          HOME: homedir(),
+          LANG: process.env.LANG ?? 'C.UTF-8',
+          PDF2ZH_PDF: pdfPath,
+          PDF2ZH_OUT_DIR: outDir,
+          PDF2ZH_PROGRESS_PATH: job.progressPath,
+          PDF2ZH_PAGES: job.pages,
+          PDF2ZH_BILINGUAL: job.bilingual ? '1' : '',
+          PDF2ZH_VLLM_URL: baseURL,
+          PDF2ZH_API: profile.api === 'anthropic-messages' ? 'anthropic' : 'openai',
+          PDF2ZH_MODEL: job.model,
+          PDF2ZH_API_KEY: await this.resolveApiKey(profile.apiKeyEnv),
+          PDF2ZH_CONCURRENCY: String(this.settings.concurrency),
+          PDF2ZH_GLOSSARY: join(this.config.skillDir, 'glossary.md'),
+        },
+      })
+      if (typeof fd === 'number') closeSync(fd)
+      child.once('error', () => { /* watcher settles via missing/stale progress */ })
+      child.unref()
+      job.childPid = child.pid ?? 0
+      if (job.childPid > 0) this.children.set(job.id, job.childPid)
     } catch (error) {
-      job.status = 'failed'
-      job.endedAt = Date.now()
-      job.error = `会话已创建但提示被拒绝：${error instanceof Error ? error.message : String(error)}`.slice(0, 300)
-      this.addJob(job)
-      throw new Error(job.error)
+      failFast(`启动翻译进程失败：${error instanceof Error ? error.message : String(error)}`)
     }
     this.addJob(job)
-    return { sessionId: created.sessionId, cwd, title, jobId: job.id, provider: job.provider, model: job.model, modelNote: job.modelNote }
+    return {
+      jobId: job.id,
+      title,
+      provider: job.provider,
+      model: job.model,
+      modelNote: job.modelNote,
+      outputDir: outDir,
+      pipeline: true,
+    }
+  }
+
+  /** Remove a job's progress/log files (best effort). */
+  async cleanupJobFiles(job) {
+    for (const base of [this.jobProgressPath(job), this.jobLogPath(job)]) {
+      for (const p of [base, `${base}.tmp`]) {
+        try { await unlink(p) } catch { /* absent */ }
+      }
+    }
   }
 
   /** Re-dispatch a finished/failed job with its stored params; replaces the old card. */
@@ -946,10 +1025,12 @@ class Pdf2Zh {
       // translate() records its own failure; retire the stale card either way.
       this.jobs = this.jobs.filter((j) => j.id !== id)
       await this.saveJobs()
+      await this.cleanupJobFiles(old)
       throw error
     }
     this.jobs = this.jobs.filter((j) => j.id !== id)
     await this.saveJobs()
+    await this.cleanupJobFiles(old)
     return { ...result, retriedFrom: id }
   }
 
@@ -1079,10 +1160,13 @@ class Pdf2Zh {
           version: VERSION,
           python: this.config.python,
           pymupdf: this.pymupdf,
+          requests: this.requests,
           skill: this.skill,
           uploadDir: this.config.uploadDir,
           outputDir: this.settings.outputDir,
           timeoutMinutes: this.settings.timeoutMinutes,
+          concurrency: this.settings.concurrency,
+          pipelineDir: PIPELINE_DIR,
         })
         return
       }
@@ -1159,10 +1243,12 @@ class Pdf2Zh {
       if (req.method === 'POST' && sub === '/jobs/delete') {
         const body = await this.readBody(req)
         const id = typeof body.id === 'string' ? body.id : ''
-        const before = this.jobs.length
+        const target = this.jobs.find((j) => j.id === id)
+        if (!target) throw new Error('job not found')
+        if (target.status === 'running') this.killPipeline(target)
         this.jobs = this.jobs.filter((j) => j.id !== id)
-        if (this.jobs.length === before) throw new Error('job not found')
         await this.saveJobs()
+        await this.cleanupJobFiles(target)
         this.sendJson(res, 200, { ok: true, removed: id })
         return
       }
@@ -1172,10 +1258,37 @@ class Pdf2Zh {
         return
       }
       if (req.method === 'POST' && sub === '/jobs/clear') {
-        const before = this.jobs.length
+        const removed = this.jobs.filter((j) => j.status !== 'running')
         this.jobs = this.jobs.filter((j) => j.status === 'running')
         await this.saveJobs()
-        this.sendJson(res, 200, { ok: true, removed: before - this.jobs.length })
+        for (const job of removed) await this.cleanupJobFiles(job)
+        this.sendJson(res, 200, { ok: true, removed: removed.length })
+        return
+      }
+      if (req.method === 'GET' && sub === '/file') {
+        const id = url.searchParams.get('job') ?? ''
+        const wanted = resolve(url.searchParams.get('path') ?? '')
+        const job = this.jobs.find((j) => j.id === id)
+        if (!job) throw new Error('任务不存在')
+        const allowed = new Set(job.outputPaths ?? [])
+        if (!allowed.has(wanted)) throw new Error('该文件不在任务产出列表中')
+        let st
+        try {
+          st = await stat(wanted)
+        } catch {
+          throw new Error('文件不存在或已被移动')
+        }
+        if (!st.isFile()) throw new Error('不是文件')
+        const ext = wanted.toLowerCase().split('.').pop()
+        const types = { pdf: 'application/pdf', md: 'text/markdown; charset=utf-8', txt: 'text/plain; charset=utf-8' }
+        res.writeHead(200, {
+          'content-type': types[ext] ?? 'application/octet-stream',
+          'content-length': st.size,
+          'content-disposition': `inline; filename*=UTF-8''${encodeURIComponent(basename(wanted))}`,
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+        })
+        createReadStream(wanted).pipe(res)
         return
       }
       if (req.method === 'POST' && sub === '/extract') {
@@ -1229,6 +1342,12 @@ function clampTimeout(value) {
   const n = Math.round(Number(value))
   if (!Number.isFinite(n)) return DEFAULT_TIMEOUT_MINUTES
   return Math.min(MAX_TIMEOUT_MINUTES, Math.max(10, n))
+}
+
+function clampConcurrency(value) {
+  const n = Math.round(Number(value))
+  if (!Number.isFinite(n)) return DEFAULT_CONCURRENCY
+  return Math.min(MAX_CONCURRENCY, Math.max(1, n))
 }
 
 export function apply(ctx, config = {}) {

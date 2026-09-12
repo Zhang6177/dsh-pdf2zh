@@ -2,47 +2,49 @@
 
 学术论文 PDF 英转中的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）插件。
 
-把「脚本提取 + 会话内模型逐节翻译」的 pdf2zh 流程装进 dsh：插件在每次启动时自动安装/同步 **pdf2zh 技能**（`~/.dsh/skills/pdf2zh/`），提供一个小的本机 API（`/api/pdf2zh/*`，仅回环同源），并在 Web GUI 里加一个侧边栏入口 + 中列面板：**填 PDF 路径 → 提取预览 → 一键新建会话开始翻译 → 翻译看板实时看进度**。
+**v0.8 起为结构化快速管线**：填 PDF 路径 → 一键翻译 → 看板实时看进度 → **产出排版保真的中文 PDF（`<原名>.zh.pdf`，图/公式/表格保持原文与原位）+ 中文 Markdown**。提取、分段、渲染全部由确定性脚本完成，模型只负责「段落级文本翻译」——并且**显式关闭思考模式、按批并发请求**，实测一篇 35 页 / 10 万字符的论文全程约 **2.5–3 分钟**（本地 vLLM，Qwen3.8-27B-FP8，8 路并发）。
 
-零外部服务、零额外 API key：提取用 PyMuPDF 脚本（自动处理双栏布局、公式原样保留），翻译由当前会话的模型按技能流程完成，术语表（glossary）保证跨论文译名一致。
+不再经由 DSH 会话/Agent 翻译（旧架构整篇串行 + 思考模式 + 逐轮重放上下文，实测 60+ 分钟）。
+
+## 工作原理（pipeline/）
+
+1. **`extract.py` 结构化提取**（PyMuPDF）：双栏阅读序、drop-cap/续段合并、章节标题识别、页眉页脚与站点封面剔除、参考文献区检测（不翻译）、公式块检测——独立公式整块裁剪为 3× 图片、行内公式以 `⟨n⟩` 占位；位图图片带原位 bbox 提取。
+2. **`translate.py` 并发翻译**：可翻译段落按 ~3600 字符分批（标题单独成批），线程池并发（默认 8 路，可在设置中调节）打 OpenAI 兼容 `/chat/completions`（也支持 Anthropic messages 协议）。请求带 `chat_template_kwargs:{enable_thinking:false}` 关闭思考；system 提示词内嵌术语表；`序号. 译文` 编号协议 + 缺号校验 + 3 次退避重试；绝大多数段落失败（如鉴权错误）时快速终止并报错。
+3. **`render.py` 排版保真渲染**：每页与原文同尺寸的三层合成——图片按原 bbox 嵌回、公式整块/行内以裁剪小图回插（占位符定位，丢失时兜底排段尾）、中文译文按原段落 bbox 流式排版（CJK 逐字断行、字号自适应收缩）。
+4. **`run_pipeline.py` 编排**：以上串成一条命令，全程向宿主的进度文件（`<DSH home>/pdf2zh/jobs/<id>.json`）原子写入 `stage/done/total/phase` 与最终 `result`（产出清单、统计、失败段数、渲染警告），看板据此显示**真实**的「翻译 x/y 段」进度；同时产出 `<原名>.zh.md`（伴生 Markdown，公式/插图注明见 PDF）与可选 `<原名>.en-zh.md`。
 
 ## 功能
 
-- **技能自动安装**：启动时把 `skill/SKILL.md`、`skill/extract.py` 同步到 `<DSH home>/skills/pdf2zh/`（内容有差异才覆盖）；`glossary.md` 仅在缺失时播种——你积累的术语表不会被升级覆盖。
-- **提取预览**：面板里填服务器上的 PDF 路径（或直接**拖拽/选择本地 PDF 上传**，文件落到 `<DSH home>/pdf2zh/uploads/`，重名自动加 `-1` 后缀），点「提取预览」即可看到页数/字符数与前 1200 字符抽查结果（提取产物为 PDF 同目录的 `<同名>.txt`，带 `[PAGE n]` 标记）。
-- **一键翻译**：点「开始翻译」，插件通过 `sessionController` 新建一个真实 DSH 会话（工作区取保存目录，未设置则为 PDF 所在目录），自动重命名为 `[pdf2zh] <文件名>`，并把触发 pdf2zh 技能的提示词排进队列；任务随即出现在「翻译看板」上，**无需进入会话**即可跟踪到结束。
-- **翻译看板**：面板顶部实时汇总**进行中 / 已完成 / 已失败**的文件数量与总体进度条，每个文件带独立进度条（按译文 `.zh.md` 的落盘字节数估算，完成即 100%）。会话状态由 host 权威结算：轮询 `sessionController.list` 的 `running` 标志 + `sessionQuery` 的 `turn/end` 事件证据判定成败与结束时间；超时（默认 240 分钟）自动终止会话并记为失败。看板支持单条移除与「清空已完成」，账本持久化在 `<DSH home>/pdf2zh/jobs.json`，host 重启后自动续跑/补结算。
-- **设置弹窗**：点击面板右上角「⚙ 设置」按钮打开分栏弹窗（Tab 页切换，不占用主面板）。「模型 API」页：顶部**自动选择**推荐卡片（优先本地部署 API，实时显示解析结果），其下按 provider 分卡片列出 dsh 注册表中的全部 API（provider 头像、可用/本地标签、点选打勾即存默认）；「输出与超时」页：保存路径（带常用目录快捷回填、留空 = 源 PDF 同目录、自动创建、兜底复制）与超时快选 chips（30 分 / 1 / 2 / 4 / 12 小时 + 自定义）。设置持久化在 `<DSH home>/pdf2zh/settings.json`。
-- **模型 API 选择**：弹窗列出 dsh 本体同一份 LLM 注册表里的全部 API（DeepSeek、Qwen、本地部署等，在 dsh「设置 → 模型」中添加/改密钥后自动同步），点选即保存为默认。开始翻译按「本次指定 > 已保存默认 > 自动（优先本地部署）」解析并用 `sessionController.selectModel` 绑定到新会话。**连通性探活**：发起前对候选 API 的端点做 GET 探测（任何 HTTP 响应算可达），「自动」模式会跳过不可达的 API 并在任务上标注；手动/默认指定的 API 不可达时快速失败（不建会话），看板给出可操作提示。
-- **失败重试**：已失败任务卡片带「重试」按钮（`POST /jobs/retry`），按原参数（路径/页码/对照/附录）重新发起并替换旧卡片；连接类错误额外提示「启动模型服务或更换 API」。
-- **手动添加 API**：「模型 API」页底部「＋ 手动添加 API」表单——填显示名/标识、协议（OpenAI 兼容 / Anthropic / Responses）、base URL、API Key（可选，无鉴权端点留空），点「获取模型（兼测试连接）」直接探测端点模型列表并勾选注册，也可手动逐行填模型 id。保存即写入 dsh 自身的 `llm-pi-ai` 设置命名空间（`~/.dsh/settings.yaml`，与「设置 → 模型」同一存储、保留注释、带 revision 乐观并发保护）与凭据库（`~/.dsh/.credentials.yaml`，密钥不回显、界面永不下发）；`llm-pi-ai` 适配器实时订阅该命名空间，**无需重启即可出现在列表并用于翻译**（若个别版本需重启，弹窗会提示）。自添加的 provider 卡片带「自添加」标签并可两步确认删除（连同其派生密钥）。
-- **选项**：页码范围（如 `1-8`、`1,3,5-9`，**默认留空 = 全文**）、中英对照（额外产出 `<同名>.en-zh.md`）、含附录（默认只翻正文）。
-- **术语表在线编辑**：面板里可直接编辑并保存术语表（`POST /glossary` 写回 `glossary.md`），格式为每行一条 `英文: 中文`（`#` 开头为注释）。
-- **界面**：顶部为「填 PDF 路径 → 提取预览 → 开始翻译 → 看板看进度」四步引导；看板置于引导下方、全程可见（每 5 秒自动刷新），统计用三张色条卡片、进行中任务带流光进度条与呼吸状态点；各区卡片有图标题头与轻投影；拖拽上传区为居中圆钮风格；路径输入下方保留最近使用过的路径（localStorage，点击即回填，回车直接提取）；提取成功以绿色卡片展示页数/字符统计与输出路径，可折叠抽查前 1200 字符；术语表卡片内联展示前 5 条、可展开全文；底部状态条以绿/红圆点区分 PyMuPDF 与技能同步的健康状态。
-- **状态透明**：面板底部实时显示插件版本、Python/PyMuPDF 可用性与技能同步路径；`GET /health` 可供外部检查。
+- **技能自动安装**：启动时把 `skill/SKILL.md`、`skill/extract.py` 同步到 `<DSH home>/skills/pdf2zh/`（内容有差异才覆盖）；`glossary.md` 仅在缺失时播种——你积累的术语表不会被升级覆盖（管线翻译时也读取同一份术语表）。
+- **提取预览**：面板里填服务器上的 PDF 路径（或**拖拽/选择本地 PDF 上传**到 `<DSH home>/pdf2zh/uploads/`），点「提取预览」查看页数/字符数与前 1200 字符抽查。
+- **一键翻译**：点「开始翻译」，插件解析选定的模型 API（含可达性探测），以 `detached` 子进程启动翻译管线（独立进程组，**dsh-web 重启不影响在途任务**，看板自动续跟），任务登记进看板。
+- **翻译看板**：顶部实时汇总**进行中 / 已完成 / 已失败**数量与总体进度条；每张卡片显示真实进度（阶段 + 「翻译 x/y 段」）、所用 API、完成后的页数/段数/公式/图片统计；已完成卡片直接给出**可点击的产出下载链接**（`GET /file`，白名单限定任务产出）；失败卡片带「重试」按钮与可操作提示（不可达 / 鉴权失败分别提示）。账本持久化在 `<DSH home>/pdf2zh/jobs.json`；超时（默认 240 分钟）终止翻译进程并记失败；删除卡片会一并终止其运行中的进程。
+- **设置弹窗**（右上角「⚙ 设置」）：
+  - **模型 API** 页：顶部「自动选择」卡片（优先本地部署 API、探活跳过不可达端点），其下按 provider 卡片列出 dsh 注册表中的全部 API（点选即存默认）；「＋ 手动添加 API」表单（显示名/标识/协议/URL/Key，支持「获取模型」探测与手动填写，写入 dsh `llm-pi-ai` 设置与凭据库、热生效，自添加项可两步确认删除）。
+  - **输出与性能** 页：保存路径（常用目录快捷回填、留空 = 源 PDF 同目录）、**翻译并发**（1–16，默认 8；对本地 vLLM 即篇内并发请求数）、任务超时（30 分–12 小时 + 自定义）。
+- **端点解析**：开始翻译按「本次指定 > 已保存默认 > 自动（本地优先 + 探活）」选定 provider；从 dsh 设置取 `baseURL`/`apiKeyEnv`，密钥经宿主 env → `~/.dsh/.credentials.yaml` 解析后仅通过子进程环境变量传入（不进命令行参数、不落日志，错误信息里的 `sk-` 自动打码）。端点不可达或未显式配置 `baseURL` 时快速失败（不启动管线），看板给出可操作提示。
+- **失败重试**：按原参数（路径/页码/对照）重新发起并替换旧卡片。
+- **选项**：页码范围（如 `1-8`、`1,3,5-9`，**默认全文**）、中英对照（额外产出 `<同名>.en-zh.md`）。「含附录」选项保留（管线始终翻到参考文献前）。
+- **术语表在线编辑**：面板内编辑保存（写回 `glossary.md`），每行 `英文: 中文`。
+- **界面**：四步引导 + 看板每 5 秒自动刷新；统计三张色条卡片、进行中任务流光进度条与呼吸状态点；底部状态条绿/红圆点显示 Python/PyMuPDF 健康状态与当前默认 API；全中文界面、北京时间。
+- **状态透明**：面板底部显示插件版本与技能同步路径；`GET /health` 可供外部检查。
 
 ## 安装
 
-前提：Node ≥ 22.19、dsh ≥ 0.1.2，Python 3 + PyMuPDF（`pip install pymupdf`，`python3 -c "import fitz"` 可运行）。
+前提：Node ≥ 22.19、dsh ≥ 0.1.2、Python 3 + PyMuPDF（`import fitz` 可用；`requests` 用于翻译请求）、系统中文字体（默认找 `~/.local/share/fonts/NotoSansCJKsc-Regular.otf`，可用 `PDF2ZH_CJK_FONT` 覆盖）。
 
 ```sh
-# 1. 拉取源码
 git clone https://github.com/Zhang6177/dsh-pdf2zh.git
 cd dsh-pdf2zh
-
-# 2. 构建客户端包（需要时；仓库已附构建好的 lib/client.js）
-pnpm install
-pnpm build
-
-# 3. 在 dsh profile 里挂载（以 web profile 为例）
-#    ~/.dsh/profiles/web/package.json：
-#      "dependencies": { "dsh-pdf2zh": "link:/path/to/dsh-pdf2zh" }
-#      "dsh": { "profile": { "bundles": [ ..., "dsh-pdf2zh" ] } }
+pnpm install && pnpm build           # 仓库已附构建好的 lib/client.js
+# ~/.dsh/profiles/web/package.json：
+#   "dependencies": { "dsh-pdf2zh": "link:/path/to/dsh-pdf2zh" }
+#   "dsh": { "profile": { "bundles": [ ..., "dsh-pdf2zh" ] } }
 pnpm install --prefix ~/.dsh/profiles/web
-systemctl --user restart dsh-web   # 或你托管 dsh web 的方式
+systemctl --user restart dsh-web
 ```
 
-插件行由包内 `cordis.patch.yml` 自动插入（`id: pdf2zh`）。启用/停用按行 id 匹配：在 profile 的 `cordis.patch.yml` 里加 `- id: pdf2zh` / `disabled: true` 即可停用。
+插件行由包内 `cordis.patch.yml` 自动插入（`id: pdf2zh`）。启用/停用按行 id 匹配。
 
 ## 配置
 
@@ -52,52 +54,66 @@ systemctl --user restart dsh-web   # 或你托管 dsh web 的方式
 |---|---|---|
 | `enabled` | `true` | 总开关；关闭后 API 返回 503 |
 | `apiPath` | `/api/pdf2zh` | 同源 API 前缀 |
-| `python` | `python3` | extract.py 使用的解释器 |
+| `python` | `python3` | 翻译管线使用的解释器（需有 PyMuPDF + requests） |
 | `skillSync` | `true` | 启动时同步技能文件 |
 | `skillDir` | `<DSH home>/skills/pdf2zh` | 技能安装目录（可覆盖） |
 | `uploadDir` | `<DSH home>/pdf2zh/uploads` | 拖拽上传的存放目录（可覆盖） |
-| `outputDir` | `""` | 翻译结果保存目录初始值（空 = 与源 PDF 同目录）；运行期以面板「设置」（`settings.json`）为准 |
-| `timeoutMinutes` | `240` | 单个翻译任务超时（分钟，10–1440）初始值；`settings.json` 里同名字段优先（API `POST /settings` 可改） |
+| `outputDir` | `""` | 翻译结果保存目录初始值；运行期以面板「设置」（`settings.json`）为准 |
+| `timeoutMinutes` | `240` | 单任务超时（分钟，10–1440）初始值；`settings.json` 优先 |
 
-## API（仅本机回环、同源）
+面板运行期设置（`<DSH home>/pdf2zh/settings.json`）：`outputDir`、`timeoutMinutes`、`model{provider,model}`、`concurrency`（1–16，默认 8）。
+
+## API（仅本机回环、同源，无鉴权——插件 API 惯例）
 
 | 路由 | 方法 | 说明 |
 |---|---|---|
-| `/api/pdf2zh/health` | GET | 插件/Python/PyMuPDF/技能状态 |
+| `/api/pdf2zh/health` | GET | 插件/Python/PyMuPDF/技能/并发/管线目录状态 |
 | `/api/pdf2zh/skill` | GET | 已安装技能文件清单 |
-| `/api/pdf2zh/glossary` | GET | 当前术语表（条数 + 全文） |
-| `/api/pdf2zh/glossary` | POST | `{text}` → 保存术语表，返回新条数 |
-| `/api/pdf2zh/extract` | POST | `{path, pages?}` → 运行 extract.py，返回 `{outPath, pages, chars, preview}` |
-| `/api/pdf2zh/translate` | POST | `{path, pages?, bilingual?, appendix?, sourceChars?, model?, workspace?}` → 新建会话、绑定模型 API、排队技能提示词并登记看板任务，返回 `{sessionId, cwd, title, jobId, provider, model}` |
-| `/api/pdf2zh/upload` | POST | 原始 PDF 二进制（文件名在 `x-pdf2zh-filename` 头，percent-encoded）→ 存入 `uploadDir`，返回 `{path, filename, bytes}` |
-| `/api/pdf2zh/settings` | GET | 当前 UI 设置（`{outputDir, timeoutMinutes, model}`） |
-| `/api/pdf2zh/settings` | POST | `{outputDir?, timeoutMinutes?, model?}` → 校验并持久化设置（自动建目录；`model:{provider,model}` 留空对 = 自动优先本地） |
-| `/api/pdf2zh/models` | GET | dsh 模型目录：全部 provider/模型（含 `userAdded`/`base`/`hasKey` 标记）、当前默认、解析出的自动选择（本地优先）、`canManage` |
-| `/api/pdf2zh/models/discover` | POST | `{baseURL, api?, apiKey?}` → 经 dsh `llm.discoverModels` 探测端点模型列表（兼连接测试，密钥仅本次使用不落盘） |
-| `/api/pdf2zh/models/add` | POST | `{provider, displayName?, api, baseURL, apiKey?, models:[{id,name?,contextWindow?}]}` → 写入 dsh `llm-pi-ai` 设置 + 凭据库（热生效，失败自动回滚密钥） |
-| `/api/pdf2zh/models/remove` | POST | `{provider}` → 删除用户层 provider 档案（派生命名的密钥一并清理） |
-| `/api/pdf2zh/jobs` | GET | 看板数据：全部任务（含实时 `progress`/`elapsedMs`）+ `summary` 计数 |
-| `/api/pdf2zh/jobs/delete` | POST | `{id}` → 从看板移除一条任务 |
-| `/api/pdf2zh/jobs/retry` | POST | `{id}` → 按原参数重试已结束/失败的任务（新建会话并替换旧卡片） |
-| `/api/pdf2zh/jobs/clear` | POST | `{}` → 清空全部已完成/已失败任务（保留进行中） |
+| `/api/pdf2zh/glossary` | GET/POST | 术语表读取 / 保存 `{text}` |
+| `/api/pdf2zh/extract` | POST | `{path, pages?}` → 运行 extract.py 预览 |
+| `/api/pdf2zh/translate` | POST | `{path, pages?, bilingual?, appendix?, sourceChars?, model?}` → 探活并启动翻译管线子进程，返回 `{jobId, provider, model, modelNote, outputDir, pipeline:true}` |
+| `/api/pdf2zh/upload` | POST | 原始 PDF 二进制（文件名在 `x-pdf2zh-filename` 头） |
+| `/api/pdf2zh/settings` | GET/POST | UI 设置读取 / 保存（`outputDir?/timeoutMinutes?/model?/concurrency?`） |
+| `/api/pdf2zh/models` | GET | dsh 模型目录（含 `userAdded/base/hasKey`、默认、自动解析、`canManage`） |
+| `/api/pdf2zh/models/discover` | POST | `{baseURL, api?, apiKey?}` → 探测端点模型列表 |
+| `/api/pdf2zh/models/add` | POST | 注册新 provider（写 dsh 设置 + 凭据库，热生效，失败回滚） |
+| `/api/pdf2zh/models/remove` | POST | 删除用户层 provider（派生密钥一并清理） |
+| `/api/pdf2zh/jobs` | GET | 看板数据：全部任务（`progress`/`phase`/`elapsedMs`/`stats`）+ `summary` |
+| `/api/pdf2zh/file` | GET | `?job=<id>&path=<产出>` → 下载/预览任务产出（仅限该任务登记的文件） |
+| `/api/pdf2zh/jobs/delete` | POST | `{id}` → 移除任务（进行中会终止其管线进程） |
+| `/api/pdf2zh/jobs/retry` | POST | `{id}` → 按原参数重试并替换旧卡片 |
+| `/api/pdf2zh/jobs/clear` | POST | `{}` → 清空已完成/已失败（保留进行中） |
 
 `path` 必须是服务器上的绝对路径且以 `.pdf` 结尾（≤100 MB）。
 
-## 翻译纪律（由技能保证）
+## 翻译纪律（由管线 system 提示词保证）
 
-公式不翻译（LaTeX 原样保留）；参考文献不翻译；模型名/数据集名/指标/引用编号/数字单位原样保留；提取不到的图片内容只标注 `(图：…)` 不脑补；学术书面中文文体。详见 `skill/SKILL.md`。
+公式不翻译（整块裁剪原图 / 行内 `⟨n⟩` 占位回插原图）；参考文献区不翻译；模型名/数据集名/指标/引用编号/URL/代码符号/数字单位原样保留；学术书面中文；术语表强制一致。
 
 ## 目录结构
 
 ```
 ├── cordis.patch.yml          # 插件行插入（id: pdf2zh）
 ├── package.json              # 双端包：. → host，./client → 浏览器半
-├── src/index.js              # host 入口（纯 ESM JS，无构建）
+├── src/index.js              # host 入口（纯 ESM JS，无构建）：路由 + 管线调度 + 看板账本
 ├── src/client/index.ts       # 浏览器半源码（React.createElement 风格）
-├── lib/client.js             # 浏览器端构建产物（tsdown/rolldown，react 外部化）
-├── skill/                    # pdf2zh 技能（SKILL.md / extract.py / glossary.md）
+├── lib/client.js             # 客户端构建产物（tsdown，react 外部化）
+├── pipeline/                 # 结构化翻译管线（vendored python）
+│   ├── extract.py            #   版式感知提取
+│   ├── translate.py          #   并发段落翻译（关思考；OpenAI/Anthropic 双协议）
+│   ├── render.py             #   排版保真中文 PDF 渲染
+│   └── run_pipeline.py       #   编排 + 进度文件 + Markdown 伴生产物
+├── skill/                    # pdf2zh 交互技能（供聊天会话使用；含术语表种子）
 └── tsdown.client.config.mjs  # 客户端打包配置
 ```
+
+## 性能参考
+
+| 论文 | 旧架构（会话整篇+思考max） | v0.8 管线（关思考、8 路并发） |
+|---|---|---|
+| manuscript（35 页 / 102k 字符 / 152 段 / 50 公式 / 18 图） | ≈66 分钟 | 提取 1.2s + 翻译 116s + 渲染 39s ≈ **2.6 分钟** |
+
+吞吐随端点并发扩展（实测同一 vLLM：单流 42 tok/s → 5 并发聚合 147 tok/s），并发数与端点 `max-num-seqs` 相关，可在「输出与性能」中调节。
 
 ## License
 

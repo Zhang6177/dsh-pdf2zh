@@ -13,7 +13,7 @@
  *
  * The header "⚙ 设置" button opens a tabbed settings modal: 模型 API (all
  * providers/models from the dsh LLM registry, click to set the translation
- * default, auto = prefer local) and 输出与超时 (save dir + timeout presets).
+ * default, auto = prefer local) and 输出与性能 (save dir, pipeline concurrency, timeout).
  *
  * Failure policy mirrors the reference plugins: DOM mounting problems are
  * logged, never thrown — a throwing client apply fails the whole web boot.
@@ -74,7 +74,7 @@ interface Job {
   pdfPath: string
   pdfName: string
   title: string
-  sessionId: string
+  sessionId?: string
   cwd: string
   outputDir: string
   provider: string
@@ -89,6 +89,9 @@ interface Job {
   endedAt?: number
   error?: string
   note?: string
+  phase?: string
+  failedParagraphs?: number
+  stats?: { pages?: number; paragraphs?: number; to_translate?: number; math_items?: number; images?: number }
   progress: number
   elapsedMs: number
   outputPaths?: string[]
@@ -104,15 +107,17 @@ interface Settings {
   outputDir: string
   timeoutMinutes: number
   model: ModelSelection
+  concurrency?: number
 }
 
 interface TranslateResult {
   ok: boolean
-  sessionId: string
   jobId: string
   provider: string
   model: string
   modelNote?: string
+  outputDir?: string
+  pipeline?: boolean
 }
 
 interface ModelsResult {
@@ -183,6 +188,7 @@ const api = {
     outputDir?: string
     timeoutMinutes?: number
     model?: ModelSelection
+    concurrency?: number
   }): Promise<Settings> => call<Settings>(`${API_PREFIX}/settings`, 'POST', body),
   models: (): Promise<ModelsResult> => call<ModelsResult>(`${API_PREFIX}/models`, 'GET'),
   modelsDiscover: (body: { baseURL: string; api?: string; apiKey?: string }): Promise<{ ok: boolean; models: DiscoveredModel[] }> =>
@@ -568,7 +574,7 @@ function AddAPIForm({ taken, onAdded, onCancel }: {
 }
 
 /* ------------------------------------------------------------------ *\
- * Settings modal — tabbed (模型 API / 输出与超时)
+ * Settings modal — tabbed (模型 API / 输出与性能)
  * ------------------------------------------------------------------ */
 
 const TIMEOUT_PRESETS = [
@@ -578,6 +584,8 @@ const TIMEOUT_PRESETS = [
   { v: 240, label: '4 小时' },
   { v: 720, label: '12 小时' },
 ]
+
+const CONCURRENCY_PRESETS = [2, 4, 8, 12]
 
 function SettingsModal({ settings, onClose, onSaved }: {
   settings: Settings | null
@@ -590,6 +598,7 @@ function SettingsModal({ settings, onClose, onSaved }: {
   const [savingModel, setSavingModel] = useState('')
   const [outputDir, setOutputDir] = useState(settings?.outputDir ?? '')
   const [timeoutMinutes, setTimeoutMinutes] = useState(String(settings?.timeoutMinutes ?? 240))
+  const [concurrency, setConcurrency] = useState(String(settings?.concurrency ?? 8))
   const [recentDirs, setRecentDirs] = useState<string[]>(() => readRecentList(RECENT_DIR_KEY, RECENT_DIR_MAX))
   const [savingForm, setSavingForm] = useState(false)
   const [error, setError] = useState('')
@@ -601,6 +610,7 @@ function SettingsModal({ settings, onClose, onSaved }: {
     if (settings !== null) {
       setOutputDir(settings.outputDir)
       setTimeoutMinutes(String(settings.timeoutMinutes))
+      setConcurrency(String(settings.concurrency ?? 8))
     }
   }, [settings])
 
@@ -639,18 +649,19 @@ function SettingsModal({ settings, onClose, onSaved }: {
       const next = await api.settingsSave({
         outputDir: outputDir.trim(),
         timeoutMinutes: Number(timeoutMinutes) || undefined,
+        concurrency: Number(concurrency) || undefined,
       })
       onSaved(next)
       if (next.outputDir !== '') setRecentDirs(pushRecentDir(next.outputDir))
       setNotice(next.outputDir
-        ? `已保存：译文保存到 ${next.outputDir}（超时 ${next.timeoutMinutes} 分钟）`
-        : `已保存：译文保存在源 PDF 同目录（超时 ${next.timeoutMinutes} 分钟）`)
+        ? `已保存：译文保存到 ${next.outputDir}（并发 ${next.concurrency ?? 8}，超时 ${next.timeoutMinutes} 分钟）`
+        : `已保存：译文保存在源 PDF 同目录（并发 ${next.concurrency ?? 8}，超时 ${next.timeoutMinutes} 分钟）`)
     } catch (err: any) {
       setError(err?.message ?? String(err))
     } finally {
       setSavingForm(false)
     }
-  }, [outputDir, timeoutMinutes, onSaved])
+  }, [outputDir, timeoutMinutes, concurrency, onSaved])
 
   /** Form success: refresh catalog, optionally set the new provider as default. */
   const onProviderAdded = useCallback(async (r: AddModelProfileResult, wantDefault: boolean): Promise<void> => {
@@ -744,7 +755,7 @@ function SettingsModal({ settings, onClose, onSaved }: {
         e('button', { type: 'button', className: `pdf2zh-tab-btn${tab === 'api' ? ' pdf2zh-tab-on' : ''}`, onClick: () => setTab('api') },
           svg(ICONS.plug, 14), '模型 API'),
         e('button', { type: 'button', className: `pdf2zh-tab-btn${tab === 'output' ? ' pdf2zh-tab-on' : ''}`, onClick: () => setTab('output') },
-          svg(ICONS.folder, 14), '输出与超时'),
+          svg(ICONS.folder, 14), '输出与性能'),
       ),
 
       e('div', { className: 'pdf2zh-modal-body' },
@@ -823,7 +834,7 @@ function SettingsModal({ settings, onClose, onSaved }: {
           : e(React.Fragment, null,
               e('div', { className: 'pdf2zh-modal-desc' },
                 svg(ICONS.info, 14),
-                e('span', null, '译文（.zh.md / 中英对照 .en-zh.md）的统一落盘位置与任务超时；对之后新发起的翻译生效。'),
+                e('span', null, '翻译产物的统一落盘位置与管线参数；对之后新发起的翻译生效。'),
               ),
               e('div', { className: 'pdf2zh-field-card' },
                 e('div', { className: 'pdf2zh-field-label' }, e('span', { className: 'pdf2zh-field-icon' }, svg(ICONS.folder, 14)), '保存路径'),
@@ -847,7 +858,31 @@ function SettingsModal({ settings, onClose, onSaved }: {
                       }, d.split('/').pop())),
                     )
                   : null,
-                e('div', { className: 'pdf2zh-field-hint' }, '需为服务器上的绝对路径（保存时自动创建）。若模型把译文写到源 PDF 旁，任务完成时插件会兜底复制到这里。'),
+                e('div', { className: 'pdf2zh-field-hint' }, '需为服务器上的绝对路径（保存时自动创建）。每篇产出 <原名>.zh.pdf（排版保真）与 <原名>.zh.md。'),
+              ),
+              e('div', { className: 'pdf2zh-field-card' },
+                e('div', { className: 'pdf2zh-field-label' }, e('span', { className: 'pdf2zh-field-icon' }, svg(ICONS.translate, 14)), '翻译并发'),
+                e('div', { className: 'pdf2zh-preset-row' },
+                  CONCURRENCY_PRESETS.map((c) => e('button', {
+                    key: c,
+                    type: 'button',
+                    className: `pdf2zh-preset${String(c) === concurrency ? ' pdf2zh-preset-on' : ''}`,
+                    onClick: () => setConcurrency(String(c)),
+                  }, `${c} 路`)),
+                  e('span', { className: 'pdf2zh-preset-custom' },
+                    e('input', {
+                      className: 'pdf2zh-input pdf2zh-preset-input',
+                      style: { ...INPUT_STYLE, padding: '6px 10px', fontSize: 13 },
+                      value: concurrency,
+                      type: 'number',
+                      min: 1,
+                      max: 16,
+                      onChange: (ev: any) => setConcurrency(ev.target.value),
+                    }),
+                    e('span', { className: 'pdf2zh-preset-unit' }, '并发'),
+                  ),
+                ),
+                e('div', { className: 'pdf2zh-field-hint' }, '1–16。同时向模型服务发出的翻译请求数；本地 vLLM 建议 8。数值过高会挤占同一 GPU 上其它会话的吞吐。'),
               ),
               e('div', { className: 'pdf2zh-field-card' },
                 e('div', { className: 'pdf2zh-field-label' }, e('span', { className: 'pdf2zh-field-icon' }, svg(ICONS.clock, 14)), '任务超时'),
@@ -871,7 +906,7 @@ function SettingsModal({ settings, onClose, onSaved }: {
                     e('span', { className: 'pdf2zh-preset-unit' }, '分钟'),
                   ),
                 ),
-                e('div', { className: 'pdf2zh-field-hint' }, '10–1440 分钟。超时后插件会终止翻译会话并把任务记为失败。'),
+                e('div', { className: 'pdf2zh-field-hint' }, '10–1440 分钟。超时后插件会终止翻译进程并把任务记为失败。'),
               ),
             ),
         error !== '' ? e(Strip, { kind: 'error', text: error }) : null,
@@ -900,7 +935,8 @@ function SettingsModal({ settings, onClose, onSaved }: {
 
 function JobRow({ job, onDelete, onRetry }: { job: Job; onDelete: (id: string) => void; onRetry: (id: string) => void }): any {
   const pct = Math.round(job.progress * 100)
-  const connDown = job.status === 'failed' && /TRANSPORT|Connection|不可达|连接/i.test(job.error ?? '')
+  const connDown = job.status === 'failed' && /TRANSPORT|Connection|不可达|连接|未启动|已退出/i.test(job.error ?? '')
+  const authDown = job.status === 'failed' && /401|403|Unauthorized|Forbidden|鉴权/i.test(job.error ?? '')
   return e('div', { className: `pdf2zh-job pdf2zh-job-${job.status}`, key: job.id },
     e('div', { className: 'pdf2zh-job-head' },
       e('span', { className: `pdf2zh-job-statusdot pdf2zh-job-statusdot-${job.status}` }),
@@ -909,7 +945,7 @@ function JobRow({ job, onDelete, onRetry }: { job: Job; onDelete: (id: string) =
       job.status === 'failed' ? e('button', {
         type: 'button',
         className: 'pdf2zh-retry-btn',
-        title: '按原参数重新发起翻译（新建会话，替换本条记录）',
+        title: '按原参数重新运行翻译管线（替换本条记录）',
         onClick: () => { onRetry(job.id) },
       }, '重试') : null,
       e('span', { className: 'pdf2zh-job-time', title: `创建：${fmtBeijing(job.createdAt)}` },
@@ -920,27 +956,39 @@ function JobRow({ job, onDelete, onRetry }: { job: Job; onDelete: (id: string) =
       e('button', {
         type: 'button',
         className: 'pdf2zh-job-del',
-        title: job.status === 'running' ? '从看板移除（不会终止翻译会话）' : '从看板移除',
+        title: job.status === 'running' ? '从看板移除（并终止进行中的翻译进程）' : '从看板移除',
         onClick: () => { onDelete(job.id) },
       }, '×'),
     ),
     e('div', { className: 'pdf2zh-job-bar' },
       e(ProgressBar, { value: job.progress, status: job.status }),
       e('span', { className: `pdf2zh-job-pct pdf2zh-job-pct-${job.status}` }, `${pct}%`),
+      job.status === 'running' && job.phase ? e('span', { className: 'pdf2zh-job-phase' }, job.phase) : null,
     ),
     (job.provider !== '' || job.modelNote !== undefined)
       ? e('div', { className: 'pdf2zh-job-meta' },
           job.provider !== '' ? e('span', { className: 'pdf2zh-job-api' }, svg(ICONS.plug, 11), ` ${job.provider}/${job.model}`) : null,
           job.modelNote ? e('span', { className: 'pdf2zh-job-warn' }, job.modelNote) : null,
+          job.status === 'done' && job.stats?.pages
+            ? e('span', { className: 'pdf2zh-job-stats' },
+                `${job.stats.pages} 页 · ${job.stats.to_translate ?? '?'} 段 · 公式 ${job.stats.math_items ?? 0} · 图 ${job.stats.images ?? 0}`)
+            : null,
         )
       : null,
     job.status === 'done' && (job.outputPaths?.length ?? 0) > 0
       ? e('div', { className: 'pdf2zh-job-meta' },
-          job.outputPaths!.map((p) => e('span', { key: p, className: 'pdf2zh-job-out' }, `→ ${p}`)),
+          job.outputPaths!.map((p) => e('a', {
+            key: p,
+            className: 'pdf2zh-job-out pdf2zh-job-outlink',
+            title: `打开 ${p}`,
+            href: `${API_PREFIX}/file?job=${encodeURIComponent(job.id)}&path=${encodeURIComponent(p)}`,
+            target: '_blank',
+            rel: 'noreferrer',
+          }, `↓ ${p.split('/').pop()}`)),
         )
       : null,
     job.status === 'done' && (job.outputPaths?.length ?? 0) === 0
-      ? e('div', { className: 'pdf2zh-job-meta' }, job.note ?? '翻译已完成，输出文件见会话汇报。')
+      ? e('div', { className: 'pdf2zh-job-meta' }, job.note ?? '翻译已完成（输出文件不在记录中，请检查保存目录）。')
       : null,
     job.note && job.status !== 'done'
       ? e('div', { className: 'pdf2zh-job-meta' }, e('span', { className: 'pdf2zh-job-warn' }, job.note))
@@ -948,7 +996,8 @@ function JobRow({ job, onDelete, onRetry }: { job: Job; onDelete: (id: string) =
     job.status === 'failed' && job.error
       ? e('div', { className: 'pdf2zh-job-meta' },
           e('span', { className: 'pdf2zh-job-error' }, job.error),
-          connDown ? e('span', { className: 'pdf2zh-job-hintline' }, '模型服务不在线：先在服务器启动对应服务（vLLM 等），或在「⚙ 设置 → 模型 API」换用其它可用 API，然后点「重试」。') : null,
+          authDown ? e('span', { className: 'pdf2zh-job-hintline' }, 'API 鉴权失败：在「⚙ 设置 → 模型 API」检查该 API 的 Key（可删除后重新添加），然后点「重试」。') : null,
+          connDown && !authDown ? e('span', { className: 'pdf2zh-job-hintline' }, '模型服务不在线：先在服务器启动对应服务（vLLM 等），或在「⚙ 设置 → 模型 API」换用其它可用 API，然后点「重试」。') : null,
         )
       : null,
   )
@@ -1153,7 +1202,8 @@ function Panel({ hide }: { hide: () => void }): any {
       })
       remember(trimmed)
       const via = result.provider ? `（API ${result.provider}/${result.model}）` : ''
-      setNotice(`翻译任务已创建${via}，进度见上方「翻译看板」。`)
+      const to = result.outputDir ? `，产出保存到 ${result.outputDir}` : ''
+      setNotice(`翻译管线已启动${via}${to}；进度见上方「翻译看板」，完成后卡片可下载中文 PDF。`)
       refreshJobs()
     } catch (err: any) {
       setError(err?.message ?? String(err))
@@ -2240,6 +2290,9 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
 .pdf2zh-job-pct-running { color: var(--dsw-alias-state-business-primary); }
 .pdf2zh-job-pct-done { color: var(--dsw-alias-state-success-primary); }
 .pdf2zh-job-pct-failed { color: var(--dsw-alias-state-error-primary); }
+.pdf2zh-job-phase { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--dsw-alias-label-secondary); }
+.pdf2zh-job-outlink { color: var(--dsw-alias-brand-primary); text-decoration: none; }
+.pdf2zh-job-outlink:hover { text-decoration: underline; }
 .pdf2zh-job-meta {
   display: flex;
   flex-direction: column;
