@@ -11,14 +11,14 @@
 1. **`extract.py` 结构化提取**（PyMuPDF）：双栏阅读序、drop-cap/续段合并、章节标题识别、页眉页脚与站点封面剔除、参考文献区检测（不翻译）、公式块检测——独立公式整块裁剪为 3× 图片、行内公式以 `⟨n⟩` 占位；位图图片带原位 bbox 提取。
 2. **`translate.py` 并发翻译**：可翻译段落按 ~3600 字符分批（标题单独成批），线程池并发（默认 8 路，可在设置中调节）打 OpenAI 兼容 `/chat/completions`（也支持 Anthropic messages 协议）。请求带 `chat_template_kwargs:{enable_thinking:false}` 关闭思考；system 提示词内嵌术语表；`序号. 译文` 编号协议 + 缺号校验 + 3 次退避重试；绝大多数段落失败（如鉴权错误）时快速终止并报错。
 3. **`render.py` 排版保真渲染**：每页与原文同尺寸的三层合成——图片按原 bbox 嵌回、公式整块/行内以裁剪小图回插（占位符定位，丢失时兜底排段尾）、中文译文按原段落 bbox 流式排版（CJK 逐字断行、字号自适应收缩）。
-4. **`run_pipeline.py` 编排**：以上串成一条命令，全程向宿主的进度文件（`<DSH home>/pdf2zh/jobs/<id>.json`）原子写入 `stage/done/total/phase` 与最终 `result`（产出清单、统计、失败段数、渲染警告），看板据此显示**真实**的「翻译 x/y 段」进度；同时产出 `<原名>.zh.md`（伴生 Markdown，公式/插图注明见 PDF）与可选 `<原名>.en-zh.md`。
+4. **`run_pipeline.py` 编排**：以上串成一条命令，全程向宿主的进度文件（`<dataDir>/jobs/<id>.json`）原子写入 `stage/done/total/phase` 与最终 `result`（产出清单、统计、失败段数、渲染警告），看板据此显示**真实**的「翻译 x/y 段」进度；同时产出 `<原名>.zh.md`（伴生 Markdown，公式/插图注明见 PDF）与可选 `<原名>.en-zh.md`。
 
 ## 功能
 
-- **技能自动安装**：启动时把 `skill/SKILL.md`、`skill/extract.py` 同步到 `<DSH home>/skills/pdf2zh/`（内容有差异才覆盖）；`glossary.md` 仅在缺失时播种——你积累的术语表不会被升级覆盖（管线翻译时也读取同一份术语表）。
-- **提取预览**：面板里填服务器上的 PDF 路径（或**拖拽/选择本地 PDF 上传**到 `<DSH home>/pdf2zh/uploads/`），点「提取预览」查看页数/字符数与前 1200 字符抽查。
+- **技能自动安装（不落 home）**：技能实体文件保存在 `<dataDir>/skills/pdf2zh/`，启动时同步内容有差异才覆盖；`~/.dsh/skills/pdf2zh` 只是一个指向它的符号链接（供 dsh 聊天技能发现用，home 内不存实际数据）。`glossary.md` 仅在缺失时播种——你积累的术语表不会被升级覆盖（管线翻译时也读取同一份术语表）。
+- **提取预览**：面板里填服务器上的 PDF 路径（或**拖拽/选择本地 PDF 上传**到 `<dataDir>/uploads/`），点「提取预览」查看页数/字符数与前 1200 字符抽查。
 - **一键翻译**：点「开始翻译」，插件解析选定的模型 API（含可达性探测），以 `detached` 子进程启动翻译管线（独立进程组，**dsh-web 重启不影响在途任务**，看板自动续跟），任务登记进看板。
-- **翻译看板**：顶部实时汇总**进行中 / 已完成 / 已失败**数量与总体进度条；每张卡片显示真实进度（阶段 + 「翻译 x/y 段」）、所用 API、完成后的页数/段数/公式/图片统计；已完成卡片直接给出**可点击的产出下载链接**（`GET /file`，白名单限定任务产出）；失败卡片带「重试」按钮与可操作提示（不可达 / 鉴权失败分别提示）。账本持久化在 `<DSH home>/pdf2zh/jobs.json`；超时（默认 240 分钟）终止翻译进程并记失败；删除卡片会一并终止其运行中的进程。
+- **翻译看板**：顶部实时汇总**进行中 / 已完成 / 已失败**数量与总体进度条；每张卡片显示真实进度（阶段 + 「翻译 x/y 段」）、所用 API、完成后的页数/段数/公式/图片统计；已完成卡片直接给出**可点击的产出下载链接**（`GET /file`，白名单限定任务产出）；失败卡片带「重试」按钮与可操作提示（不可达 / 鉴权失败分别提示）。账本持久化在 `<dataDir>/jobs.json`；超时（默认 240 分钟）终止翻译进程并记失败；删除卡片会一并终止其运行中的进程。
 - **设置弹窗**（右上角「⚙ 设置」）：
   - **模型 API** 页：顶部「自动选择」卡片（优先本地部署 API、探活跳过不可达端点），其下按 provider 卡片列出 dsh 注册表中的全部 API（点选即存默认）；「＋ 手动添加 API」表单（显示名/标识/协议/URL/Key，支持「获取模型」探测与手动填写，写入 dsh `llm-pi-ai` 设置与凭据库、热生效，自添加项可两步确认删除）。
   - **输出与性能** 页：保存路径（常用目录快捷回填、留空 = 源 PDF 同目录）、**翻译并发**（1–16，默认 8；对本地 vLLM 即篇内并发请求数）、任务超时（30 分–12 小时 + 自定义）。
@@ -55,13 +55,15 @@ systemctl --user restart dsh-web
 | `enabled` | `true` | 总开关；关闭后 API 返回 503 |
 | `apiPath` | `/api/pdf2zh` | 同源 API 前缀 |
 | `python` | `python3` | 翻译管线使用的解释器（需有 PyMuPDF + requests） |
+| `dataDir` | `<插件目录>/data` | **插件数据根目录**：settings/jobs 账本、进度与日志、上传、技能实体、术语表全在这里；默认位于 `/data02/.../dsh/plugin/dsh-pdf2zh/data`，**不再写 `~/.dsh`**。也可用环境变量 `PDF2ZH_DATA_DIR` 覆盖 |
+| `migrateFromHome` | `true` | 首次启动自动把旧版存放在 `~/.dsh` 的数据复制进 `dataDir` 并重写账本路径（旧目录保留，可手动删除） |
 | `skillSync` | `true` | 启动时同步技能文件 |
-| `skillDir` | `<DSH home>/skills/pdf2zh` | 技能安装目录（可覆盖） |
-| `uploadDir` | `<DSH home>/pdf2zh/uploads` | 拖拽上传的存放目录（可覆盖） |
+| `skillDir` | `<dataDir>/skills/pdf2zh` | 技能实体目录（可覆盖；`~/.dsh/skills/pdf2zh` 为指向它的符号链接） |
+| `uploadDir` | `<dataDir>/uploads` | 拖拽上传的存放目录（可覆盖） |
 | `outputDir` | `""` | 翻译结果保存目录初始值；运行期以面板「设置」（`settings.json`）为准 |
 | `timeoutMinutes` | `240` | 单任务超时（分钟，10–1440）初始值；`settings.json` 优先 |
 
-面板运行期设置（`<DSH home>/pdf2zh/settings.json`）：`outputDir`、`timeoutMinutes`、`model{provider,model}`、`concurrency`（1–16，默认 8）。
+面板运行期设置（`<dataDir>/settings.json`）：`outputDir`、`timeoutMinutes`、`model{provider,model}`、`concurrency`（1–16，默认 8）。
 
 ## API（仅本机回环、同源，无鉴权——插件 API 惯例）
 
@@ -98,6 +100,7 @@ systemctl --user restart dsh-web
 ├── src/index.js              # host 入口（纯 ESM JS，无构建）：路由 + 管线调度 + 看板账本
 ├── src/client/index.ts       # 浏览器半源码（React.createElement 风格）
 ├── lib/client.js             # 客户端构建产物（tsdown，react 外部化）
+├── data/                     # 插件数据根目录（gitignore：设置/账本/上传/技能实体/术语表）
 ├── pipeline/                 # 结构化翻译管线（vendored python）
 │   ├── extract.py            #   版式感知提取
 │   ├── translate.py          #   并发段落翻译（关思考；OpenAI/Anthropic 双协议）

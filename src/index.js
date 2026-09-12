@@ -27,7 +27,7 @@
  *       POST /jobs/clear    — remove all finished (done/failed) jobs
  *  3. Watch every running job through its pipeline progress file
  *     (<DSH home>/pdf2zh/jobs/<id>.json: stage + paragraph counters),
- *     persisting the board ledger to ~/.dsh/pdf2zh/jobs.json.
+ *     persisting the board ledger to <dataDir>/jobs.json.
  *
  * v0.8: translation is no longer done inside a DSH session. The host spawns
  * `pipeline/run_pipeline.py` (PyMuPDF layout extraction → batched paragraph
@@ -39,10 +39,10 @@
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { closeSync, createReadStream, openSync } from 'node:fs'
-import { copyFile, mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, readFile, readdir, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { createRequire } from 'node:module'
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import z from 'schemastery'
 
@@ -87,10 +87,12 @@ function dshHome() {
 export const Config = z.object({
   enabled: z.boolean().default(true).description('Master switch; when false the API answers 503.'),
   apiPath: z.string().default('/api/pdf2zh').description('Same-origin API prefix.'),
-  python: z.string().default('python3').description('Python interpreter used by extract.py.'),
-  skillSync: z.boolean().default(true).description('Sync bundled skill files into the DSH skill dir on boot.'),
-  skillDir: z.string().description('Skill dir override; defaults to <DSH home>/skills/pdf2zh.'),
-  uploadDir: z.string().description('Drag-drop upload dir override; defaults to <DSH home>/pdf2zh/uploads.'),
+  python: z.string().default('python3').description('Python interpreter used by the translation pipeline.'),
+  dataDir: z.string().default('').description('Plugin data root (settings, job ledger, uploads, skill copy). Defaults to <plugin dir>/data — nothing is stored under the user home.'),
+  migrateFromHome: z.boolean().default(true).description('One-time boot migration: copy pre-v0.9 data out of ~/.dsh into dataDir and leave ~/.dsh/skills/pdf2zh as a symlink to the migrated skill copy.'),
+  skillSync: z.boolean().default(true).description('Sync bundled skill files into the skill dir on boot.'),
+  skillDir: z.string().description('Skill dir override; defaults to <dataDir>/skills/pdf2zh (also reachable through ~/.dsh/skills/pdf2zh symlink for DSH discovery).'),
+  uploadDir: z.string().description('Drag-drop upload dir override; defaults to <dataDir>/uploads.'),
   outputDir: z.string().default('').description('Initial translation output dir; the UI setting (settings.json) overrides it at runtime.'),
   timeoutMinutes: z.number().default(DEFAULT_TIMEOUT_MINUTES).description('Initial per-job translation timeout (10-1440 minutes).'),
 })
@@ -98,15 +100,19 @@ export const Config = z.object({
 class Pdf2Zh {
   constructor(ctx, config) {
     this.ctx = ctx
+    const dataDir = (typeof config.dataDir === 'string' && config.dataDir.trim() !== ''
+      ? config.dataDir.trim()
+      : (process.env.PDF2ZH_DATA_DIR || join(PKG_ROOT, 'data'))).replace(/\/+$/, '')
+    this.dataDir = dataDir
     this.config = {
       enabled: config.enabled ?? true,
       apiPath: (config.apiPath ?? '/api/pdf2zh').replace(/\/+$/, ''),
       python: config.python ?? 'python3',
+      migrateFromHome: config.migrateFromHome ?? true,
       skillSync: config.skillSync ?? true,
-      skillDir: (config.skillDir || join(dshHome(), 'skills', 'pdf2zh')).replace(/\/+$/, ''),
-      uploadDir: (config.uploadDir || join(dshHome(), 'pdf2zh', 'uploads')).replace(/\/+$/, ''),
+      skillDir: (config.skillDir || join(dataDir, 'skills', 'pdf2zh')).replace(/\/+$/, ''),
+      uploadDir: (config.uploadDir || join(dataDir, 'uploads')).replace(/\/+$/, ''),
     }
-    this.dataDir = join(dshHome(), 'pdf2zh')
     this.settingsPath = join(this.dataDir, 'settings.json')
     this.jobsPath = join(this.dataDir, 'jobs.json')
     this.jobsDir = join(this.dataDir, 'jobs')
@@ -138,6 +144,7 @@ class Pdf2Zh {
   }
 
   async bootstrap() {
+    await this.migrateFromHome()
     if (this.config.skillSync) await this.syncSkill()
     await this.checkPymupdf()
     await this.loadSettings()
@@ -145,7 +152,82 @@ class Pdf2Zh {
     this.startWatcher()
   }
 
-  /** Copy managed skill files over the install; seed the glossary once. */
+  /**
+   * Copy any pre-v0.9 storage out of the user home into dataDir (never
+   * overwriting existing files), rewrite the ledger's persisted paths, and
+   * turn ~/.dsh/skills/pdf2zh into a symlink to the migrated skill copy so
+   * DSH's chat-skill discovery keeps working with zero bytes of real data in
+   * home. The old ~/.dsh/pdf2zh dir is left in place for the user to delete.
+   */
+  async migrateFromHome() {
+    if (!this.config.migrateFromHome) return
+    try {
+      const legacyData = join(dshHome(), 'pdf2zh')
+      if (resolve(legacyData) !== resolve(this.dataDir)) {
+        const copied = await this.copyTreeIfMissing(legacyData, this.dataDir)
+        if (copied > 0) {
+          try {
+            const raw = await readFile(this.jobsPath, 'utf8')
+            const patched = raw.split(`${legacyData}/`).join(`${this.dataDir}/`)
+            if (patched !== raw) await writeFile(this.jobsPath, patched, { mode: 0o644 })
+          } catch { /* no ledger to rewrite */ }
+          this.ctx.logger.info(`[pdf2zh] 已迁移旧数据 ${legacyData} → ${this.dataDir}（旧目录未删除，可自行清理）`)
+        }
+      }
+      const legacySkill = join(dshHome(), 'skills', 'pdf2zh')
+      const skillReal = this.config.skillDir
+      if (resolve(legacySkill) !== resolve(skillReal)) {
+        await mkdir(skillReal, { recursive: true })
+        await this.copyTreeIfMissing(legacySkill, skillReal)
+        let st = null
+        try { st = await lstat(legacySkill) } catch { /* absent */ }
+        if (st === null) {
+          try { await symlink(skillReal, legacySkill, 'dir') } catch { /* home unwritable */ }
+        } else if (!st.isSymbolicLink()) {
+          try {
+            await rename(legacySkill, `${legacySkill}.pre-v0.9`)
+            await symlink(skillReal, legacySkill, 'dir')
+            this.ctx.logger.info(`[pdf2zh] ~/.dsh/skills/pdf2zh 已改为指向 ${skillReal} 的符号链接（原目录备份为 *.pre-v0.9）`)
+          } catch (error) {
+            this.ctx.logger.warn(error instanceof Error ? error : new Error(String(error)))
+          }
+        }
+      }
+    } catch (error) {
+      this.ctx.logger.warn(error instanceof Error ? error : new Error(String(error)))
+    }
+  }
+
+  /** Recursive cp -n. Returns the number of files copied. */
+  async copyTreeIfMissing(srcRoot, dstRoot) {
+    let entries
+    try {
+      entries = await readdir(srcRoot, { recursive: true, withFileTypes: true })
+    } catch {
+      return 0
+    }
+    let copied = 0
+    for (const ent of entries) {
+      if (!ent.isFile()) continue
+      const parent = ent.parentPath ?? ent.path ?? srcRoot
+      const rel = relative(srcRoot, join(parent, ent.name))
+      if (rel === '' || rel.startsWith('..')) continue
+      const dst = join(dstRoot, rel)
+      try {
+        await stat(dst)
+        continue
+      } catch { /* missing — copy below */ }
+      try {
+        await mkdir(dirname(dst), { recursive: true })
+        await copyFile(join(parent, ent.name), dst)
+        copied += 1
+      } catch { /* best effort */ }
+    }
+    return copied
+  }
+
+  /** Copy managed skill files over the skill dir (now living under the plugin
+   *  data root); seed the glossary once. */
   async syncSkill() {
     await mkdir(this.skill.dir, { recursive: true })
     const changed = []
@@ -394,11 +476,11 @@ class Pdf2Zh {
   }
 
   jobProgressPath(job) {
-    return join(this.jobsDir, `${job.id}.json`)
+    return job.progressPath || join(this.jobsDir, `${job.id}.json`)
   }
 
   jobLogPath(job) {
-    return join(this.jobsDir, `${job.id}.log`)
+    return job.logPath || join(this.jobsDir, `${job.id}.log`)
   }
 
   async readProgress(job) {
@@ -1167,6 +1249,7 @@ class Pdf2Zh {
           timeoutMinutes: this.settings.timeoutMinutes,
           concurrency: this.settings.concurrency,
           pipelineDir: PIPELINE_DIR,
+          dataDir: this.dataDir,
         })
         return
       }
