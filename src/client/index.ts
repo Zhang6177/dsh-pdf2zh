@@ -199,6 +199,8 @@ const api = {
     call<RemoveModelProfileResult>(`${API_PREFIX}/models/remove`, 'POST', body),
   jobs: (): Promise<JobsResult> => call<JobsResult>(`${API_PREFIX}/jobs`, 'GET'),
   jobDelete: (id: string): Promise<{ ok: boolean }> => call<{ ok: boolean }>(`${API_PREFIX}/jobs/delete`, 'POST', { id }),
+  jobRetry: (id: string): Promise<TranslateResult & { retriedFrom: string }> =>
+    call<TranslateResult & { retriedFrom: string }>(`${API_PREFIX}/jobs/retry`, 'POST', { id }),
   jobsClear: (): Promise<{ ok: boolean; removed: number }> => call<{ ok: boolean; removed: number }>(`${API_PREFIX}/jobs/clear`, 'POST', {}),
 }
 
@@ -896,13 +898,20 @@ function SettingsModal({ settings, onClose, onSaved }: {
  * Translation board
  * ------------------------------------------------------------------ */
 
-function JobRow({ job, onDelete }: { job: Job; onDelete: (id: string) => void }): any {
+function JobRow({ job, onDelete, onRetry }: { job: Job; onDelete: (id: string) => void; onRetry: (id: string) => void }): any {
   const pct = Math.round(job.progress * 100)
+  const connDown = job.status === 'failed' && /TRANSPORT|Connection|不可达|连接/i.test(job.error ?? '')
   return e('div', { className: `pdf2zh-job pdf2zh-job-${job.status}`, key: job.id },
     e('div', { className: 'pdf2zh-job-head' },
       e('span', { className: `pdf2zh-job-statusdot pdf2zh-job-statusdot-${job.status}` }),
       e('span', { className: 'pdf2zh-job-name', title: job.pdfPath }, job.pdfName),
       e('span', { className: `pdf2zh-badge pdf2zh-badge-${job.status}` }, STATUS_LABEL[job.status]),
+      job.status === 'failed' ? e('button', {
+        type: 'button',
+        className: 'pdf2zh-retry-btn',
+        title: '按原参数重新发起翻译（新建会话，替换本条记录）',
+        onClick: () => { onRetry(job.id) },
+      }, '重试') : null,
       e('span', { className: 'pdf2zh-job-time', title: `创建：${fmtBeijing(job.createdAt)}` },
         job.status === 'running'
           ? `已用时 ${fmtElapsed(job.elapsedMs)}`
@@ -937,7 +946,10 @@ function JobRow({ job, onDelete }: { job: Job; onDelete: (id: string) => void })
       ? e('div', { className: 'pdf2zh-job-meta' }, e('span', { className: 'pdf2zh-job-warn' }, job.note))
       : null,
     job.status === 'failed' && job.error
-      ? e('div', { className: 'pdf2zh-job-meta' }, e('span', { className: 'pdf2zh-job-error' }, job.error))
+      ? e('div', { className: 'pdf2zh-job-meta' },
+          e('span', { className: 'pdf2zh-job-error' }, job.error),
+          connDown ? e('span', { className: 'pdf2zh-job-hintline' }, '模型服务不在线：先在服务器启动对应服务（vLLM 等），或在「⚙ 设置 → 模型 API」换用其它可用 API，然后点「重试」。') : null,
+        )
       : null,
   )
 }
@@ -949,11 +961,12 @@ function StatCard({ status, value, label }: { status: 'running' | 'done' | 'fail
   )
 }
 
-function Board({ jobs, summary, onDelete, onClear }: {
+function Board({ jobs, summary, onDelete, onClear, onRetry }: {
   jobs: Job[]
   summary: JobsResult['summary']
   onDelete: (id: string) => void
   onClear: () => void
+  onRetry: (id: string) => void
 }): any {
   const total = jobs.length
   const overall = total > 0 ? jobs.reduce((acc, j) => acc + j.progress, 0) / total : 0
@@ -987,7 +1000,7 @@ function Board({ jobs, summary, onDelete, onClear }: {
             e('span', { className: 'pdf2zh-empty-icon' }, svg(ICONS.board, 22)),
             e('span', null, '暂无翻译任务 — 填好路径点「开始翻译」后，进度会在这里实时更新'),
           )
-        : e('div', { className: 'pdf2zh-jobs' }, jobs.map((job) => e(JobRow, { key: job.id, job, onDelete }))),
+        : e('div', { className: 'pdf2zh-jobs' }, jobs.map((job) => e(JobRow, { key: job.id, job, onDelete, onRetry }))),
     ],
   })
 }
@@ -1153,6 +1166,17 @@ function Panel({ hide }: { hide: () => void }): any {
     api.jobDelete(id).then(refreshJobs).catch((err: any) => setError(err?.message ?? String(err)))
   }, [refreshJobs])
 
+  const onJobRetry = useCallback((id: string): void => {
+    setError('')
+    setNotice('')
+    api.jobRetry(id)
+      .then((r) => {
+        setNotice(`已重试：${r.provider ? `新任务使用 API ${r.provider}/${r.model}，` : ''}进度见看板（旧记录已替换）。`)
+        refreshJobs()
+      })
+      .catch((err: any) => setError(err?.message ?? String(err)))
+  }, [refreshJobs])
+
   const onJobsClear = useCallback((): void => {
     api.jobsClear().then(refreshJobs).catch((err: any) => setError(err?.message ?? String(err)))
   }, [refreshJobs])
@@ -1205,7 +1229,7 @@ function Panel({ hide }: { hide: () => void }): any {
           )),
         ),
 
-        e(Board, { jobs, summary, onDelete: onJobDelete, onClear: onJobsClear }),
+        e(Board, { jobs, summary, onDelete: onJobDelete, onClear: onJobsClear, onRetry: onJobRetry }),
 
         Section({ title: '翻译论文', note: '填服务器上的 PDF 绝对路径，或直接拖拽/选择本地 PDF 上传', icon: 'doc', children: [
           e('div', {
@@ -2355,27 +2379,46 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   border-radius: 10px;
   line-height: 1.55;
   animation: pdf2zh-slide .14s ease;
+  color: var(--dsw-alias-label-primary);
 }
 .pdf2zh-strip-icon { flex: none; display: inline-flex; margin-top: 2px; }
 .pdf2zh-strip-error {
   border: 1px solid var(--dsw-alias-state-error-primary);
-  background: var(--dsw-alias-state-error-secondary, transparent);
-  color: var(--dsw-alias-state-error-primary);
+  background: var(--dsw-alias-bg-layer-2);
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, var(--dsw-alias-bg-base));
+  color: var(--dsw-alias-label-primary);
   white-space: pre-wrap;
   word-break: break-all;
 }
+.pdf2zh-strip-error .pdf2zh-strip-icon { color: var(--dsw-alias-state-error-primary); }
 .pdf2zh-strip-notice {
   border: 1px solid var(--dsw-alias-state-success-primary);
-  background: var(--dsw-alias-state-success-secondary, transparent);
-  color: var(--dsw-alias-state-success-primary);
+  background: var(--dsw-alias-bg-layer-2);
+  background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 10%, var(--dsw-alias-bg-base));
+  color: var(--dsw-alias-label-primary);
   word-break: break-all;
 }
+.pdf2zh-strip-notice .pdf2zh-strip-icon { color: var(--dsw-alias-state-success-primary); }
+.pdf2zh-job-hintline { font-family: var(--dsw-font-family, inherit); color: var(--dsw-alias-label-tertiary); }
+.pdf2zh-retry-btn {
+  flex: none;
+  padding: 2px 10px;
+  font-size: 11px;
+  border-radius: 999px;
+  border: 1px solid var(--dsw-alias-state-business-primary);
+  background: transparent;
+  color: var(--dsw-alias-state-business-primary);
+  cursor: pointer;
+  transition: background-color .12s ease;
+}
+.pdf2zh-retry-btn:hover { background: var(--dsw-alias-interactive-bg-hover); }
 /* legacy classes still referenced by JobRow-free contexts */
 .pdf2zh-error {
   padding: 10px 13px;
   font-size: 13px;
   border-radius: 10px;
   border: 1px solid var(--dsw-alias-state-error-primary);
+  background: var(--dsw-alias-bg-layer-2);
   color: var(--dsw-alias-state-error-primary);
   white-space: pre-wrap;
   word-break: break-all;
@@ -2385,6 +2428,7 @@ html[data-dsh-pdf2zh-active] [class*='centerCol'] > :not([data-dsh-pdf2zh-view])
   font-size: 13px;
   border-radius: 10px;
   border: 1px solid var(--dsw-alias-state-success-primary);
+  background: var(--dsw-alias-bg-layer-2);
   color: var(--dsw-alias-state-success-primary);
   word-break: break-all;
 }

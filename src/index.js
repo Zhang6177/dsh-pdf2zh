@@ -22,6 +22,7 @@
  *       POST /models/remove — delete a user-added provider profile
  *       GET  /jobs          — translation job board (statuses + progress)
  *       POST /jobs/delete   — remove one job from the board
+ *       POST /jobs/retry    — re-dispatch a finished/failed job (new session, replaces the card)
  *       POST /jobs/clear    — remove all finished (done/failed) jobs
  *  3. Watch every running translation job through the host session APIs
  *     (sessionController.list polling + sessionQuery turn/end evidence),
@@ -594,16 +595,69 @@ class Pdf2Zh {
   async resolveModelSelection(requested) {
     const catalog = await this.modelCatalogSafe()
     if (requested?.provider && requested?.model) {
-      if (this.isSelectionAvailable(catalog, requested)) return { selection: requested, note: '' }
-      return { selection: this.pickDefaultSelection(catalog).selection, note: `指定的 API ${requested.provider}/${requested.model} 不在当前模型目录，已回退默认` }
+      if (this.isSelectionAvailable(catalog, requested)) return { selection: requested, note: '', explicit: true }
+      return { selection: this.pickDefaultSelection(catalog).selection, note: `指定的 API ${requested.provider}/${requested.model} 不在当前模型目录，已回退默认`, explicit: false }
     }
     const saved = this.settings.model
     if (saved.provider && saved.model) {
-      if (this.isSelectionAvailable(catalog, saved)) return { selection: { ...saved }, note: '' }
+      if (this.isSelectionAvailable(catalog, saved)) return { selection: { ...saved }, note: '', explicit: true }
       const fb = this.pickDefaultSelection(catalog)
-      return { selection: fb.selection, note: `配置的 API ${saved.provider}/${saved.model} 当前不可用（已下线或移除），已回退默认${fb.selection ? `：${fb.selection.provider}/${fb.selection.model}` : ''}` }
+      return { selection: fb.selection, note: `配置的 API ${saved.provider}/${saved.model} 当前不可用（已下线或移除），已回退默认${fb.selection ? `：${fb.selection.provider}/${fb.selection.model}` : ''}`, explicit: false }
     }
-    return this.pickDefaultSelection(catalog)
+    // Auto mode: local-first, then the host default, then every catalog group;
+    // probe each candidate whose profile carries a baseURL and skip dead ones.
+    const candidates = []
+    const groups = this.catalogGroups(catalog)
+    const local = groups.find((g) => /local|self|vllm|ollama|本地/i.test(`${g.id} ${g.name ?? ''}`))
+    if (local) candidates.push({ provider: local.id, model: local.models[0]?.id })
+    if (typeof catalog?.default?.provider === 'string' && typeof catalog?.default?.model === 'string') {
+      candidates.push({ provider: catalog.default.provider, model: catalog.default.model })
+    }
+    for (const g of groups) candidates.push({ provider: g.id, model: g.models[0]?.id })
+    const uniq = []
+    for (const c of candidates) {
+      if (c.provider && c.model && !uniq.some((u) => u.provider === c.provider && u.model === c.model)) uniq.push(c)
+    }
+    const skipped = []
+    for (const cand of uniq) {
+      const base = this.providerBase(cand.provider)
+      if (base !== '') {
+        const probe = await this.probeBaseUrl(base)
+        if (!probe.ok) { skipped.push(`${cand.provider}${probe.timedOut ? '(超时)' : ''}`); continue }
+      }
+      return { selection: cand, note: skipped.length > 0 ? `已跳过不可达 API：${skipped.join('、')}` : '', explicit: false }
+    }
+    if (uniq.length > 0) {
+      return { selection: uniq[0], note: `候选 API 均不可达${skipped.length > 0 ? `（${skipped.join('、')}）` : ''}，翻译可能失败 — 请启动模型服务或在设置中更换 API 后「重试」`, explicit: false }
+    }
+    return { selection: null, note: '模型目录为空，会话将使用 host 默认模型', explicit: false }
+  }
+
+  /** Base URL a provider profile publishes (user settings layer), or ''. */
+  providerBase(provider) {
+    const prof = this.userProviderProfiles()[provider]
+    return typeof prof?.baseURL === 'string' ? prof.baseURL : ''
+  }
+
+  /**
+   * Liveness probe for a model endpoint. Any HTTP status counts as reachable —
+   * only network-level failures (connection refused / DNS / timeout) say the
+   * service is down. Never throws.
+   */
+  async probeBaseUrl(base) {
+    const trimmed = String(base ?? '').replace(/\/+$/, '')
+    if (trimmed === '') return { ok: true }
+    const roots = trimmed.endsWith('/v1') ? [trimmed] : [trimmed, `${trimmed}/v1`]
+    let timedOut = false
+    for (const root of roots) {
+      try {
+        const resp = await fetch(`${root}/models`, { method: 'GET', signal: AbortSignal.timeout(3_000) })
+        return { ok: true, status: resp.status }
+      } catch (error) {
+        if (/TimeoutError|AbortError/.test(String(error?.name ?? ''))) timedOut = true
+      }
+    }
+    return { ok: false, timedOut }
   }
 
   /* ---------------- provider management (add/remove/discover via dsh seams) ---------------- */
@@ -776,7 +830,7 @@ class Pdf2Zh {
     const sessionController = this.ctx.get('sessionController')
     if (sessionController?.create === undefined) throw new Error('sessionController is not available in this host')
     const outputDir = await this.ensureOutputDir()
-    const { selection, note } = await this.resolveModelSelection(input.model)
+    const { selection, note, explicit } = await this.resolveModelSelection(input.model)
     const cwd = input.workspace && isAbsolute(input.workspace)
       ? resolve(input.workspace)
       : (outputDir || dirname(pdfPath))
@@ -804,6 +858,21 @@ class Pdf2Zh {
       sawRunning: false,
       outputPaths: [],
       timeoutAt: Date.now() + this.settings.timeoutMinutes * 60_000,
+    }
+    // Explicit choice (dialog default saved earlier): a dead endpoint fails fast
+    // with an actionable reason + a board job to retry, instead of a doomed session.
+    if (selection !== null && explicit) {
+      const base = this.providerBase(selection.provider)
+      if (base !== '') {
+        const probe = await this.probeBaseUrl(base)
+        if (!probe.ok) {
+          job.status = 'failed'
+          job.endedAt = Date.now()
+          job.error = `API ${selection.provider} 不可达（${base}${probe.timedOut ? '，连接超时' : '，连接被拒绝'}）：请启动模型服务，或在设置弹窗换用其它 API 后点「重试」`.slice(0, 300)
+          this.addJob(job)
+          throw new Error(job.error)
+        }
+      }
     }
     let created
     try {
@@ -856,6 +925,32 @@ class Pdf2Zh {
     }
     this.addJob(job)
     return { sessionId: created.sessionId, cwd, title, jobId: job.id, provider: job.provider, model: job.model, modelNote: job.modelNote }
+  }
+
+  /** Re-dispatch a finished/failed job with its stored params; replaces the old card. */
+  async retryJob(rawId) {
+    const id = String(rawId ?? '')
+    const old = this.jobs.find((j) => j.id === id)
+    if (!old) throw new Error('任务不存在')
+    if (old.status === 'running') throw new Error('进行中的任务不能重试')
+    let result
+    try {
+      result = await this.translate({
+        path: old.pdfPath,
+        pages: this.optionalPages(old.pages),
+        bilingual: old.bilingual === true,
+        appendix: old.appendix === true,
+        sourceChars: old.sourceChars,
+      })
+    } catch (error) {
+      // translate() records its own failure; retire the stale card either way.
+      this.jobs = this.jobs.filter((j) => j.id !== id)
+      await this.saveJobs()
+      throw error
+    }
+    this.jobs = this.jobs.filter((j) => j.id !== id)
+    await this.saveJobs()
+    return { ...result, retriedFrom: id }
   }
 
   readBody(req) {
@@ -1069,6 +1164,11 @@ class Pdf2Zh {
         if (this.jobs.length === before) throw new Error('job not found')
         await this.saveJobs()
         this.sendJson(res, 200, { ok: true, removed: id })
+        return
+      }
+      if (req.method === 'POST' && sub === '/jobs/retry') {
+        const body = await this.readBody(req)
+        this.sendJson(res, 200, { ok: true, ...(await this.retryJob(body.id)) })
         return
       }
       if (req.method === 'POST' && sub === '/jobs/clear') {
