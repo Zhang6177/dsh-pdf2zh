@@ -71,6 +71,7 @@ const DEFAULT_TIMEOUT_MINUTES = 240
 const MAX_TIMEOUT_MINUTES = 1440
 const DEFAULT_CONCURRENCY = 8
 const MAX_CONCURRENCY = 16
+const DEFAULT_FONT_SHRINK = 1.5
 const MAX_JOBS = 200
 /** dsh settings namespace owning LLM provider profiles (the Models settings page writes it too). */
 const LLM_SETTINGS_NS = 'llm-pi-ai'
@@ -87,7 +88,7 @@ function dshHome() {
 export const Config = z.object({
   enabled: z.boolean().default(true).description('Master switch; when false the API answers 503.'),
   apiPath: z.string().default('/api/pdf2zh').description('Same-origin API prefix.'),
-  python: z.string().default('python3').description('Python interpreter used by the translation pipeline.'),
+  python: z.string().default('python3').description('Preferred Python interpreter; the plugin auto-detects a better candidate (venv with pymupdf-layout) when this one lacks it.'),
   dataDir: z.string().default('').description('Plugin data root (settings, job ledger, uploads, skill copy). Defaults to <plugin dir>/data — nothing is stored under the user home.'),
   migrateFromHome: z.boolean().default(true).description('One-time boot migration: copy pre-v0.9 data out of ~/.dsh into dataDir and leave ~/.dsh/skills/pdf2zh as a symlink to the migrated skill copy.'),
   skillSync: z.boolean().default(true).description('Sync bundled skill files into the skill dir on boot.'),
@@ -95,6 +96,7 @@ export const Config = z.object({
   uploadDir: z.string().description('Drag-drop upload dir override; defaults to <dataDir>/uploads.'),
   outputDir: z.string().default('').description('Initial translation output dir; the UI setting (settings.json) overrides it at runtime.'),
   timeoutMinutes: z.number().default(DEFAULT_TIMEOUT_MINUTES).description('Initial per-job translation timeout (10-1440 minutes).'),
+  fontShrink: z.number().default(DEFAULT_FONT_SHRINK).description('Initial body font shrink in pt for CJK overlay text (0-3); the UI setting overrides at runtime.'),
 })
 
 class Pdf2Zh {
@@ -119,6 +121,7 @@ class Pdf2Zh {
     this.settings = {
       outputDir: typeof config.outputDir === 'string' ? config.outputDir : '',
       timeoutMinutes: clampTimeout(config.timeoutMinutes),
+      fontShrink: clampFontShrink(config.fontShrink),
       model: { provider: '', model: '' },
       concurrency: DEFAULT_CONCURRENCY,
     }
@@ -129,6 +132,7 @@ class Pdf2Zh {
     this.skill = { dir: this.config.skillDir, synced: false, files: [] }
     this.pymupdf = { checked: false, available: false, version: '' }
     this.requests = { available: false }
+    this.pipeline = { python: '', layout: false }
     this.polling = false
   }
 
@@ -146,6 +150,7 @@ class Pdf2Zh {
   async bootstrap() {
     await this.migrateFromHome()
     if (this.config.skillSync) await this.syncSkill()
+    await this.detectPipelineRuntime()
     await this.checkPymupdf()
     await this.loadSettings()
     await this.loadJobs()
@@ -258,6 +263,56 @@ class Pdf2Zh {
     )
   }
 
+  /**
+   * The translation pipeline prefers an interpreter that carries
+   * pymupdf-layout (GNN table/formula detection, needs Py ≥3.10 and the
+   * pdf2zh venv). Probe candidates once at boot; the first layout-capable
+   * one wins, otherwise the first pymupdf-capable one (heuristic mode).
+   */
+  async detectPipelineRuntime() {
+    // Explicit user intent wins unconditionally (and keeps tests deterministic).
+    if (typeof process.env.PDF2ZH_PYTHON === 'string' && process.env.PDF2ZH_PYTHON !== '') {
+      let layout = false
+      try {
+        await this.runPythonWith(process.env.PDF2ZH_PYTHON, ['-c', 'import pymupdf.layout'], 45_000)
+        layout = true
+      } catch { /* heuristic mode */ }
+      this.pipeline = { python: process.env.PDF2ZH_PYTHON, layout }
+      return
+    }
+    const cands = []
+    const push = (p) => { if (typeof p === 'string' && p !== '' && !cands.includes(p)) cands.push(p) }
+    if (this.config.python && this.config.python !== 'python3') {
+      let layout = false
+      try {
+        await this.runPythonWith(this.config.python, ['-c', 'import pymupdf.layout'], 45_000)
+        layout = true
+      } catch { /* heuristic mode */ }
+      this.pipeline = { python: this.config.python, layout }
+      return
+    }
+    push(join(homedir(), '.venvs', 'pdf2zh', 'bin', 'python'))
+    push('/data02/zhangqinhan/.venvs/pdf2zh/bin/python')
+    push('python3')
+    let fallback = ''
+    for (const py of cands) {
+      try {
+        await this.runPythonWith(py, ['-c', 'import pymupdf'], 25_000)
+      } catch { continue }
+      if (fallback === '') fallback = py
+      try {
+        await this.runPythonWith(py, ['-c', 'import pymupdf.layout'], 45_000)
+        this.pipeline = { python: py, layout: true }
+        this.ctx.logger.info(`[pdf2zh] pipeline python=${py} layout=GNN`)
+        return
+      } catch { /* heuristic-only candidate */ }
+    }
+    if (fallback !== '') {
+      this.pipeline = { python: fallback, layout: false }
+      this.ctx.logger.info(`[pdf2zh] pipeline python=${fallback} layout=heuristic（未找到 pymupdf-layout，建议 pip install pymupdf-layout 启用表格/公式识别）`)
+    }
+  }
+
   async checkPymupdf() {
     try {
       const out = await this.runPython(['-c', 'import fitz; print(fitz.version[0])'], 15_000)
@@ -274,8 +329,12 @@ class Pdf2Zh {
   }
 
   runPython(args, timeoutMs) {
+    return this.runPythonWith(this.pipeline.python || this.config.python, args, timeoutMs)
+  }
+
+  runPythonWith(bin, args, timeoutMs) {
     return new Promise((resolvePromise, rejectPromise) => {
-      const child = spawn(this.config.python, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+      const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
       let out = ''
       let err = ''
       let settled = false
@@ -319,6 +378,9 @@ class Pdf2Zh {
       if (typeof raw.concurrency === 'number') {
         this.settings.concurrency = clampConcurrency(raw.concurrency)
       }
+      if (typeof raw.fontShrink === 'number') {
+        this.settings.fontShrink = clampFontShrink(raw.fontShrink)
+      }
       if (raw.model && typeof raw.model === 'object') {
         const provider = typeof raw.model.provider === 'string' ? raw.model.provider.trim() : ''
         const model = typeof raw.model.model === 'string' ? raw.model.model.trim() : ''
@@ -334,6 +396,7 @@ class Pdf2Zh {
       timeoutMinutes: this.settings.timeoutMinutes,
       model: this.settings.model,
       concurrency: this.settings.concurrency,
+      fontShrink: this.settings.fontShrink,
     }, null, 2), { mode: 0o644 })
   }
 
@@ -359,6 +422,9 @@ class Pdf2Zh {
     }
     if (patch.concurrency !== undefined) {
       next.concurrency = clampConcurrency(patch.concurrency)
+    }
+    if (patch.fontShrink !== undefined) {
+      next.fontShrink = clampFontShrink(patch.fontShrink)
     }
     if (patch.model !== undefined) {
       const raw = patch.model
@@ -1036,7 +1102,10 @@ class Pdf2Zh {
       job.logPath = this.jobLogPath(job)
       let fd = 'ignore'
       try { fd = openSync(job.logPath, 'a') } catch { /* log file optional */ }
-      const child = spawn(this.config.python, [join(PIPELINE_DIR, 'run_pipeline.py')], {
+      if (this.pipeline.python === '') {
+        failFast('Python 环境不可用：需要 python3 + PyMuPDF（pip install pymupdf pymupdf-layout requests）')
+      }
+      const child = spawn(this.pipeline.python, [join(PIPELINE_DIR, 'run_pipeline.py')], {
         cwd: outDir,
         // detached = new process group: survives a dsh-web restart, and the
         // board re-adopts it through the progress file (pid + stage).
@@ -1057,6 +1126,8 @@ class Pdf2Zh {
           PDF2ZH_API_KEY: await this.resolveApiKey(profile.apiKeyEnv),
           PDF2ZH_CONCURRENCY: String(this.settings.concurrency),
           PDF2ZH_GLOSSARY: join(this.config.skillDir, 'glossary.md'),
+          PDF2ZH_FONT_SHRINK: String(this.settings.fontShrink),
+          PDF2ZH_LAYOUT: this.pipeline.layout ? 'gnn' : 'off',
         },
       })
       if (typeof fd === 'number') closeSync(fd)
@@ -1248,8 +1319,10 @@ class Pdf2Zh {
           outputDir: this.settings.outputDir,
           timeoutMinutes: this.settings.timeoutMinutes,
           concurrency: this.settings.concurrency,
+          fontShrink: this.settings.fontShrink,
           pipelineDir: PIPELINE_DIR,
           dataDir: this.dataDir,
+          runtime: this.pipeline,
         })
         return
       }
@@ -1431,6 +1504,12 @@ function clampConcurrency(value) {
   const n = Math.round(Number(value))
   if (!Number.isFinite(n)) return DEFAULT_CONCURRENCY
   return Math.min(MAX_CONCURRENCY, Math.max(1, n))
+}
+
+function clampFontShrink(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return DEFAULT_FONT_SHRINK
+  return Math.min(3, Math.max(0, Math.round(n * 2) / 2))
 }
 
 export function apply(ctx, config = {}) {

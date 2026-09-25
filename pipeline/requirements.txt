@@ -1,0 +1,4 @@
+# 翻译管线依赖（建议 python>=3.10 的独立 venv；插件启动时自动探测带 pymupdf-layout 的解释器）
+pymupdf==1.28.2
+pymupdf-layout==1.28.2   # GNN 版面分析：表格/公式/页眉页脚区域（CPU ONNX，模型随 wheel）
+requests>=2.31

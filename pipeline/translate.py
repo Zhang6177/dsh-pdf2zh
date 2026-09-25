@@ -29,11 +29,12 @@ GLOSSARY_PATH = os.environ.get("PDF2ZH_GLOSSARY") or os.path.expanduser(
 BATCH_MAX_CHARS = 3600   # 单请求输入字符上限（控制输出在 max_tokens 内）
 BATCH_MAX_PARAS = 14
 MAX_TOKENS = 16384
-RETRIES = 3
-BACKOFF = (2, 5, 15)
-REQUEST_TIMEOUT = 600
+RETRIES = 5                      # 服务端瞬时故障（如代理层 401 抖动）要能熬过去
+BACKOFF = (2, 5, 10, 20, 40)
+REQUEST_TIMEOUT = max(30, int(os.environ.get("PDF2ZH_REQ_TIMEOUT", "300")))
 # 篇内并发请求数；vLLM continuous batching 下并发≈吞吐线性扩展
 CONCURRENCY = max(1, int(os.environ.get("PDF2ZH_CONCURRENCY", "8")))
+SWEEP_BUDGET = max(30, int(os.environ.get("PDF2ZH_SWEEP_BUDGET", "420")))  # 补扫总时长上限
 
 SYSTEM_PROMPT = """你是学术论文英译中引擎。把用户给出的带编号英文段落逐段翻译成中文，严格遵守：
 1. 只输出编号译文，格式严格为“序号. 译文”（每行一段，序号与输入一一对应，数量相同）；
@@ -41,7 +42,31 @@ SYSTEM_PROMPT = """你是学术论文英译中引擎。把用户给出的带编�
 3. 数字、单位、超参数原样保留（如 82.3%、4×4、1e-4）；
 4. 公式与数学符号（含 LaTeX）保留原文，不翻译；段落中的 ⟨数字⟩ 占位符（如 ⟨1⟩）代表公式位置，必须原样保留在对应位置，不翻译、不删除、不改变序号；
 5. 章节号前缀（如“3.”）保留；
-6. 学术书面中文，长句按中文习惯断句，不要口语化，不要添加解释或注释。"""
+6. 学术书面中文，长句按中文习惯断句，不要口语化，不要添加解释或注释。
+
+【公式与符号排版铁律】译文要能直接排回 PDF，禁止任何 LaTeX 标记（渲染器不解析 LaTeX）：
+- 公式与符号**必须用 Unicode 纯文本**：禁止 `$`、`$$`、`\(`、`\)`、`\[`、`\]`；
+  禁止 `\in`、`\mathbb{R}`、`\times`、`\top`、`\dots`、`\tau`、`\exp`、`\frac` 这类反斜杠命令；
+- 正确写法：`t_k ∈ R^c`、`[t_1, …, t_K]ᵀ ∈ R^{K×c}`、`exp(s/τ)`、`∑_{k′=1}^{K}`；
+  错误写法：`$t_k \in \mathbb{R}^c$`、`\(x\)`；
+- 行内符号原样嵌入中文句子，不要拆开、不要加空格、不要改写成文字
+  （正确：`嵌入向量 t_k ∈ R^c`；错误：`嵌入向量 t 下标 k 属于 R 的 c 次方`）；
+- 保持符号相对顺序与配对：括号 `()[]{}`、上下标、分数、求和上下限必须成对完整，绝不截断；
+- 拉丁字母变量用普通字母，希腊字母直接用希腊字母字符（τ、∑、∈、⊤、×、…）；
+- 段落里的 ⟨n⟩ 占位符代表**未被提取的独立公式**位置：有几个就必须原样保留几个，位置与原文一致，
+  不得合并、重排、新增或删除；**原文没有 ⟨n⟩ 时绝不允许凭空添加**（实测模型会在无占位符的段落里
+  自行插入 ⟨1⟩⟨2⟩，虽被渲染层丢弃，但会挤乱句子结构）；
+- 绝不翻译、不要改写公式里的任何字符（含 `∈ ∑ √ ≤ ≥ × ∂ ∇`），也不要因为不认识而删除。
+
+【行内公式必须修复】原文的行内符号是从 PDF 文本层逐字提取的，**上下标层级与空格会丢失**：
+`t k ∈Rc , k = 1, . . . , K` 实为 `t_k ∈ R^c, k = 1, …, K`；`RK×c` 实为 `R^{K×c}`；
+`[ t 1, . . . , t K]⊤` 实为 `[t_1, …, t_K]ᵀ`；`pij` 实为 `p_{ij}`；`xi` 实为 `x_i`。
+翻译时请把它们**还原成正确的公式写法**：
+- 下标写 `_{}`、上标写 `^{}`；单字符可省花括号（`t_k`、`R^c`），多字符必须加（`R^{K×c}`、`x_{ij}`）；
+- 渲染器按真实上下标排版：`R^{K×c}` 会排成 R 带右上标「K×c」，花括号不会显示出来；
+- 只补上下标层级与空格，**不得增删符号、不得改变符号含义、不得臆造原文没有的公式**；
+- 提取噪声导致的字母拆分（`U si` → `U_{s_i}`、`D si` → `D_{s_i}`）按上下文合并还原；
+- 若某处符号确实无法辨认，保留原字符即可，不要编造。"""
 
 # ---------------------------------------------------------------- 在途计数
 
@@ -117,6 +142,31 @@ class Translator:
         except Exception:
             return False
 
+    def wait_until_serving(self, max_wait=240):
+        """端点恢复门：微补全返回 200 才算真正可用（401 抖动窗口里
+        HTTP 可达但鉴权失败，普通探活会误判为活）。"""
+        t_end = time.time() + max_wait
+        while True:
+            try:
+                payload = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 2, "temperature": 0,
+                }
+                if self._is_anthropic():
+                    payload["system"] = "x"
+                else:
+                    payload["chat_template_kwargs"] = {"enable_thinking": False}
+                r = _thread_session().post(self._messages_url(), headers=self._headers(),
+                                           json=payload, timeout=15)
+                if r.status_code == 200:
+                    return True
+            except Exception:
+                pass
+            if time.time() >= t_end:
+                return False
+            time.sleep(8)
+
     def _load_glossary(self):
         try:
             with open(GLOSSARY_PATH, encoding="utf-8") as f:
@@ -191,6 +241,11 @@ class Translator:
             raise ValueError("译文缺少编号: %s" % missing[:5])
         return [parsed[i + 1] for i in range(len(texts))]
 
+    _TRANSIENT_RE = re.compile(r"401|429|50[0234]|timeout|timed out|connection", re.I)
+
+    def _is_transient(self, e):
+        return bool(self._TRANSIENT_RE.search(str(e) or ""))
+
     def translate_batch(self, texts):
         """texts: [str]，返回 [str]（失败项为 None，由调用方占位）。线程安全。"""
         last_err = None
@@ -200,7 +255,11 @@ class Translator:
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 if attempt < RETRIES:
-                    time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+                    if self._is_transient(e):
+                        # 401/5xx 抖动窗口：等端点恢复再打，比固定退避有效
+                        self.wait_until_serving(BACKOFF[min(attempt, len(BACKOFF) - 1)] + 60)
+                    else:
+                        time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
         # 最后兜底：半成功解析（缺号的段落由调用方占位）
         user = "\n".join("%d. %s" % (i + 1, t) for i, t in enumerate(texts))
         try:
@@ -261,6 +320,28 @@ class Translator:
         else:
             with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
                 list(ex.map(work, units))
+
+        # 二次补扫：把瞬时故障（网关 401 抖动等）导致失败的批次再串行轻补一遍。
+        # 单 attempt 直调 + 全局时间预算，避免个别挂死批次把整篇拖爆。
+        sweep_deadline = time.time() + SWEEP_BUDGET
+        for rnd in range(2):
+            failed_units = [u for u in units if any(results.get(p.pid) is None for p in u)]
+            if not failed_units or time.time() > sweep_deadline:
+                break
+            self.wait_until_serving(60)
+            for u in failed_units:
+                if time.time() > sweep_deadline:
+                    break
+                try:
+                    trans = self._translate_once([p.text for p in u])
+                except Exception:  # noqa: BLE001
+                    continue
+                with lock:
+                    for p, t in zip(u, trans):
+                        if t:
+                            results[p.pid] = t
+                if progress_cb:
+                    progress_cb(done_box[0], total)
         return results
 
 

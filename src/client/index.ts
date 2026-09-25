@@ -50,6 +50,9 @@ interface Health {
   python: string
   pymupdf: { checked: boolean; available: boolean; version: string }
   skill: { dir: string; synced: boolean; files: string[] }
+  runtime?: { python: string; layout: boolean }
+  fontShrink?: number
+  concurrency?: number
 }
 
 interface ExtractResult {
@@ -91,7 +94,16 @@ interface Job {
   note?: string
   phase?: string
   failedParagraphs?: number
-  stats?: { pages?: number; paragraphs?: number; to_translate?: number; math_items?: number; images?: number }
+  stats?: {
+    pages?: number
+    paragraphs?: number
+    to_translate?: number
+    math_items?: number
+    images?: number
+    tables?: number
+    figure_blocks?: number
+    protected_regions?: number
+  }
   progress: number
   elapsedMs: number
   outputPaths?: string[]
@@ -108,6 +120,7 @@ interface Settings {
   timeoutMinutes: number
   model: ModelSelection
   concurrency?: number
+  fontShrink?: number
 }
 
 interface TranslateResult {
@@ -189,6 +202,7 @@ const api = {
     timeoutMinutes?: number
     model?: ModelSelection
     concurrency?: number
+    fontShrink?: number
   }): Promise<Settings> => call<Settings>(`${API_PREFIX}/settings`, 'POST', body),
   models: (): Promise<ModelsResult> => call<ModelsResult>(`${API_PREFIX}/models`, 'GET'),
   modelsDiscover: (body: { baseURL: string; api?: string; apiKey?: string }): Promise<{ ok: boolean; models: DiscoveredModel[] }> =>
@@ -586,6 +600,7 @@ const TIMEOUT_PRESETS = [
 ]
 
 const CONCURRENCY_PRESETS = [2, 4, 8, 12]
+const FONT_SHRINK_PRESETS = [0.5, 1, 1.5, 2, 2.5]
 
 function SettingsModal({ settings, onClose, onSaved }: {
   settings: Settings | null
@@ -599,6 +614,7 @@ function SettingsModal({ settings, onClose, onSaved }: {
   const [outputDir, setOutputDir] = useState(settings?.outputDir ?? '')
   const [timeoutMinutes, setTimeoutMinutes] = useState(String(settings?.timeoutMinutes ?? 240))
   const [concurrency, setConcurrency] = useState(String(settings?.concurrency ?? 8))
+  const [fontShrink, setFontShrink] = useState(String(settings?.fontShrink ?? 1.5))
   const [recentDirs, setRecentDirs] = useState<string[]>(() => readRecentList(RECENT_DIR_KEY, RECENT_DIR_MAX))
   const [savingForm, setSavingForm] = useState(false)
   const [error, setError] = useState('')
@@ -611,6 +627,7 @@ function SettingsModal({ settings, onClose, onSaved }: {
       setOutputDir(settings.outputDir)
       setTimeoutMinutes(String(settings.timeoutMinutes))
       setConcurrency(String(settings.concurrency ?? 8))
+      setFontShrink(String(settings.fontShrink ?? 1.5))
     }
   }, [settings])
 
@@ -650,18 +667,19 @@ function SettingsModal({ settings, onClose, onSaved }: {
         outputDir: outputDir.trim(),
         timeoutMinutes: Number(timeoutMinutes) || undefined,
         concurrency: Number(concurrency) || undefined,
+        fontShrink: Number(fontShrink),
       })
       onSaved(next)
       if (next.outputDir !== '') setRecentDirs(pushRecentDir(next.outputDir))
       setNotice(next.outputDir
-        ? `已保存：译文保存到 ${next.outputDir}（并发 ${next.concurrency ?? 8}，超时 ${next.timeoutMinutes} 分钟）`
-        : `已保存：译文保存在源 PDF 同目录（并发 ${next.concurrency ?? 8}，超时 ${next.timeoutMinutes} 分钟）`)
+        ? `已保存：译文保存到 ${next.outputDir}（并发 ${next.concurrency ?? 8}，字号收缩 ${next.fontShrink ?? 1.5}pt）`
+        : `已保存：译文保存在源 PDF 同目录（并发 ${next.concurrency ?? 8}，字号收缩 ${next.fontShrink ?? 1.5}pt）`)
     } catch (err: any) {
       setError(err?.message ?? String(err))
     } finally {
       setSavingForm(false)
     }
-  }, [outputDir, timeoutMinutes, concurrency, onSaved])
+  }, [outputDir, timeoutMinutes, concurrency, fontShrink, onSaved])
 
   /** Form success: refresh catalog, optionally set the new provider as default. */
   const onProviderAdded = useCallback(async (r: AddModelProfileResult, wantDefault: boolean): Promise<void> => {
@@ -885,6 +903,31 @@ function SettingsModal({ settings, onClose, onSaved }: {
                 e('div', { className: 'pdf2zh-field-hint' }, '1–16。同时向模型服务发出的翻译请求数；本地 vLLM 建议 8。数值过高会挤占同一 GPU 上其它会话的吞吐。'),
               ),
               e('div', { className: 'pdf2zh-field-card' },
+                e('div', { className: 'pdf2zh-field-label' }, e('span', { className: 'pdf2zh-field-icon' }, svg(ICONS.doc, 14)), '正文字号收缩'),
+                e('div', { className: 'pdf2zh-preset-row' },
+                  FONT_SHRINK_PRESETS.map((f) => e('button', {
+                    key: f,
+                    type: 'button',
+                    className: `pdf2zh-preset${String(f) === fontShrink ? ' pdf2zh-preset-on' : ''}`,
+                    onClick: () => setFontShrink(String(f)),
+                  }, f === 0 ? '原大小' : `−${f}pt`)),
+                  e('span', { className: 'pdf2zh-preset-custom' },
+                    e('input', {
+                      className: 'pdf2zh-input pdf2zh-preset-input',
+                      style: { ...INPUT_STYLE, padding: '6px 10px', fontSize: 13 },
+                      value: fontShrink,
+                      type: 'number',
+                      min: 0,
+                      max: 3,
+                      step: 0.5,
+                      onChange: (ev: any) => setFontShrink(ev.target.value),
+                    }),
+                    e('span', { className: 'pdf2zh-preset-unit' }, 'pt'),
+                  ),
+                ),
+                e('div', { className: 'pdf2zh-field-hint' }, '中文字面视觉偏大：排版时正文统一收缩该磅数（0–3，默认 1pt）；标题按原层级同向收缩。'),
+              ),
+              e('div', { className: 'pdf2zh-field-card' },
                 e('div', { className: 'pdf2zh-field-label' }, e('span', { className: 'pdf2zh-field-icon' }, svg(ICONS.clock, 14)), '任务超时'),
                 e('div', { className: 'pdf2zh-preset-row' },
                   TIMEOUT_PRESETS.map((p) => e('button', {
@@ -971,7 +1014,8 @@ function JobRow({ job, onDelete, onRetry }: { job: Job; onDelete: (id: string) =
           job.modelNote ? e('span', { className: 'pdf2zh-job-warn' }, job.modelNote) : null,
           job.status === 'done' && job.stats?.pages
             ? e('span', { className: 'pdf2zh-job-stats' },
-                `${job.stats.pages} 页 · ${job.stats.to_translate ?? '?'} 段 · 公式 ${job.stats.math_items ?? 0} · 图 ${job.stats.images ?? 0}`)
+                `${job.stats.pages} 页 · ${job.stats.to_translate ?? '?'} 段 · 公式 ${job.stats.math_items ?? 0} · 图 ${job.stats.images ?? 0}`
+                + (job.stats.figure_blocks ? ` · 图内文字保护 ${job.stats.figure_blocks}` : ''))
             : null,
         )
       : null,
@@ -1431,6 +1475,10 @@ function Panel({ hide }: { hide: () => void }): any {
             e('span', { className: 'pdf2zh-foot-status' },
               e(HealthDot, { ok: health.pymupdf.available, label: `PyMuPDF ${health.pymupdf.available ? health.pymupdf.version : '缺失'}` }),
               e(HealthDot, { ok: health.skill.synced, label: health.skill.synced ? '技能已同步' : '技能未同步' }),
+              e(HealthDot, {
+                ok: health.runtime ? health.runtime.layout : false,
+                label: health.runtime ? (health.runtime.layout ? '表格/公式识别 GNN' : '表格/公式识别 启发式') : '布局检测 未就绪',
+              }),
             ),
             e('span', { className: 'pdf2zh-foot-meta', title: health.skill.synced ? health.skill.dir : '' },
               `v${health.version} · ${health.python}${modelLabel}`,

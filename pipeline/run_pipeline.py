@@ -38,6 +38,10 @@ _OUT_RAW = os.environ.get("PDF2ZH_OUT_DIR", "")
 PDF = os.environ.get("PDF2ZH_PDF", "")
 PAGES = (os.environ.get("PDF2ZH_PAGES") or "").strip()
 BILINGUAL = os.environ.get("PDF2ZH_BILINGUAL") == "1"
+try:
+    FONT_SHRINK = max(0.0, min(3.0, float(os.environ.get("PDF2ZH_FONT_SHRINK", "1.5"))))
+except ValueError:
+    FONT_SHRINK = 1.5
 
 STATE = {"stage": "start", "done": 0, "total": 0, "phase": "启动",
          "pid": os.getpid(), "ts": int(time.time() * 1000)}
@@ -112,6 +116,7 @@ def slice_pdf(path, spec):
 def build_markdown(paper, translations, stem):
     """排版保真 PDF 的伴生 Markdown（正文级结构，公式/插图注明见 PDF）。"""
     lines, ref_note_written = [], False
+    fig_note = sum(len(pg.figure_blocks) for pg in paper.pages)
     for pgd in paper.pages:
         for p in pgd.paragraphs:
             if p.is_math:
@@ -138,8 +143,33 @@ def build_markdown(paper, translations, stem):
                 lines.append(zh)
             lines.append("")
     body = "\n".join(lines).strip() + "\n"
-    head = "# %s（中文译文）\n\n> 图、公式、表格保持原文与原位，详见同名 PDF。\n\n" % stem
+    head = ("# %s（中文译文）\n\n> 图、表、公式整区保持原文与原位置，**均未翻译、未改动**"
+            "（含矢量绘制的图内标注/图例/坐标轴文字%s）。\n\n"
+            % (stem, "，共 %d 处" % fig_note if fig_note else ""))
     return head + body
+
+
+def dump_translations(paper, translations, out_dir, stem):
+    """把段落与译文写成 sidecar（便于离线回放排版层做回归，无需重跑模型）。"""
+    pages = []
+    for pgd in paper.pages:
+        pars = []
+        for p in pgd.paragraphs:
+            t = translations.get(p.pid)
+            if t is None:
+                continue
+            pars.append({"pid": list(p.pid), "col": p.col,
+                         "y0": round(p.y0, 1), "y1": round(p.y1, 1),
+                         "x0": round(p.x0, 1), "x1": round(p.x1, 1),
+                         "heading": p.is_heading, "src": p.text, "text": t})
+        pages.append({"pno": pgd.pno, "paragraphs": pars})
+    path = os.path.join(out_dir, stem + ".zh.translations.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"pages": pages}, f, ensure_ascii=False)
+    except OSError:
+        return None
+    return path
 
 
 def build_bilingual(paper, translations):
@@ -165,7 +195,7 @@ def main():
     if not os.path.exists(R.CJK_FONT):
         raise RuntimeError("缺少中文字体 %s，无法渲染中文版式 PDF" % R.CJK_FONT)
 
-    stage("extract", "解析版式结构", 0, 0)
+    stage("extract", "解析版式结构（含表格/公式区域检测）", 0, 0)
     work_pdf, tmp_pdf = slice_pdf(PDF, PAGES) if PAGES else (PDF, None)
     t0 = time.time()
     try:
@@ -201,6 +231,18 @@ def main():
         n_failed = sum(1 for v in translations.values() if v is None)
         print("translate: %.1fs %d paras %d failed" % (time.time() - t0, total, n_failed), flush=True)
         if total and n_failed >= max(2, int(total * 0.7)):
+            # 端点瞬时故障（401 抖动窗口）可能整体拖爆：等恢复后为失败段全局补一轮
+            print("translate: 大面积失败，等端点恢复后全局补译…", flush=True)
+            if tr.wait_until_serving(300):
+                retry = [p for p in paras if translations.get(p.pid) is None]
+                if retry:
+                    got = tr.translate_paragraphs(retry, None)
+                    for k, v in got.items():
+                        if v:
+                            translations[k] = v
+                    n_failed = sum(1 for v in translations.values() if v is None)
+                    print("translate: 补译后剩 %d failed" % n_failed, flush=True)
+        if total and n_failed >= max(2, int(total * 0.7)):
             raise RuntimeError("绝大多数段落翻译失败（端点 %s / 模型 %s）：%s" % (
                 tr.url, tr.model, "；".join(tr.errors) or "无错误详情"))
 
@@ -210,7 +252,8 @@ def main():
         orig = fitz.open(work_pdf)
         warnings = []
         out_pdf = os.path.join(out_dir, stem + ".zh.pdf")
-        n_render_failed = R.render_pdf(paper, translations, orig, out_pdf, warnings)
+        n_render_failed = R.render_pdf(paper, translations, orig, out_pdf, warnings,
+                                        font_shrink=FONT_SHRINK)
         orig.close()
         print("render: %.1fs -> %s" % (time.time() - t0, out_pdf), flush=True)
 
@@ -219,6 +262,10 @@ def main():
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(build_markdown(paper, translations, stem))
         outputs.append(md_path)
+        if os.environ.get("PDF2ZH_DUMP_TRANSLATIONS", "1") == "1":
+            dp = dump_translations(paper, translations, out_dir, stem)
+            if dp:
+                print("dump: %s" % dp, flush=True)
         if BILINGUAL:
             bz_path = os.path.join(out_dir, stem + ".en-zh.md")
             with open(bz_path, "w", encoding="utf-8") as f:

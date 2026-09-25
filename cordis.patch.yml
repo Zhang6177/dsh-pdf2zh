@@ -1,10 +1,9 @@
 # dsh-pdf2zh bundle patch: inserts the plugin row into the profile roster.
-# Node half: syncs the pdf2zh skill into the DSH skill dir on boot, serves the
-# /api/pdf2zh/* routes (health / extract / translate / glossary / skill /
-# settings / jobs) and watches translation sessions to settle the board.
-# Browser half (exports "./client"): sidebar entry + center-column panel
-# (translation board with progress bars, path input + upload, options,
-# extract preview, save-path settings, glossary editor).
+# Node half: owns all plugin storage under <plugin dir>/data (nothing in the
+# user home), serves the /api/pdf2zh/* routes, spawns the structured fast
+# pipeline (pipeline/run_pipeline.py) for translations and settles the board
+# from per-job progress files. Browser half (exports "./client"): sidebar
+# entry + center-column panel (board, upload, options, settings modal).
 - insert:
     - id: pdf2zh
       name: 'dsh-pdf2zh'
