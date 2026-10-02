@@ -1,0 +1,33 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.19.0'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
+      - run: python -X utf8 -m pip install -r pipeline/requirements.txt
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Select Python
+        run: node -e "const fs=require('fs'); const p=require('child_process').execFileSync('python',['-c','import sys; print(sys.executable)'],{encoding:'utf8'}).trim(); fs.appendFileSync(process.env.GITHUB_ENV,'PDF2ZH_PYTHON='+p+'\n')"
+      - run: npm test
+      - run: node scripts/scan-public.mjs --history
+      - run: npm pack --dry-run

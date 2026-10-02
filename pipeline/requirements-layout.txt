@@ -1,0 +1,3 @@
+-r requirements.txt
+# Optional CPU layout model. Geometry-based protection also works without it.
+pymupdf-layout==1.28.2

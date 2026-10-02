@@ -1,0 +1,3 @@
+# Required: Python >= 3.10 (64-bit).
+pymupdf==1.28.2
+requests>=2.31,<3
