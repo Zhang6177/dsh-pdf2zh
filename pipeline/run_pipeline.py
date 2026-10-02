@@ -29,6 +29,7 @@ sys.path.insert(0, HERE)
 import pymupdf as fitz  # noqa: E402  (系统 python3 已有；渲染/提取共用)
 
 import translate as T  # noqa: E402
+import ocr  # noqa: E402
 import render as R  # noqa: E402
 from extract import extract_paper  # noqa: E402
 
@@ -195,12 +196,21 @@ def main():
     stage("extract", "解析版式结构（含表格/公式区域检测）", 0, 0)
     work_pdf, tmp_pdf = slice_pdf(PDF, PAGES) if PAGES else (PDF, None)
     t0 = time.time()
+    ocr_pdf = None
     try:
-        paper = extract_paper(work_pdf)
+        prepared, ocr_pages = ocr.prepare_pdf(work_pdf, lambda n, total: stage("ocr", "OCR 识别扫描页 %d/%d" % (n, total), n, total))
+        if prepared != work_pdf:
+            ocr_pdf, work_pdf = prepared, prepared
+        paper = extract_paper(work_pdf, ocr_pages=ocr_pages)
         st = paper.stats()
+        st["ocr_pages"] = len(ocr_pages)
         print("extract: %.1fs %s" % (time.time() - t0, st), flush=True)
-        if st["paragraphs"] < 5:
-            raise RuntimeError("看起来是扫描版 PDF（无文本层），需要先 OCR 或改用 arXiv 源码")
+        if st["to_translate"] == 0:
+            with fitz.open(work_pdf) as source:
+                has_text = any(page.get_text().strip() for page in source)
+            if not has_text:
+                raise RuntimeError("所选页面没有文本层，请先用 OCR 生成带文本层的 PDF；直接重试或更换翻译 API 无效")
+            raise RuntimeError("所选页面没有可翻译的正文；文字可能全部被识别为图表、公式或参考文献，请检查提取预览或更换页码")
         sample = "".join(p.text for p in list(paper.all_paragraphs())[:300])
         if sample:
             cjk = sum(1 for c in sample if "\u4e00" <= c <= "\u9fff")
@@ -248,6 +258,8 @@ def main():
         t0 = time.time()
         orig = fitz.open(work_pdf)
         warnings = []
+        if ocr_pages:
+            warnings.append("扫描页已通过本地 OCR 识别；识别结果和图表/公式边界可能有误，请核对译文。")
         out_pdf = os.path.join(out_dir, stem + ".zh.pdf")
         n_render_failed = R.render_pdf(paper, translations, orig, out_pdf, warnings,
                                         font_shrink=FONT_SHRINK)
@@ -278,6 +290,11 @@ def main():
         })
         print("DONE %.1fs" % (time.time()), flush=True)
     finally:
+        if ocr_pdf:
+            try:
+                os.unlink(ocr_pdf)
+            except OSError:
+                pass
         if tmp_pdf:
             try:
                 os.unlink(tmp_pdf)

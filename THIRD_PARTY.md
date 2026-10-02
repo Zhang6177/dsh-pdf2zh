@@ -11,3 +11,6 @@
 | 系统中文字体 | 中文 PDF 排版 | 不随项目分发；遵循操作系统或字体供应方条款 |
 
 项目不分发模型权重、第三方字体或论文。自建模型服务的模型许可及 API 服务条款由部署者确认。
+# 可选 OCR 数据
+
+`setup:ocr` 按需从 [Tesseract tessdata_fast](https://github.com/tesseract-ocr/tessdata_fast) 下载中英文识别数据（Apache-2.0）；数据不随源码或插件包分发。识别由 PyMuPDF 集成的 Tesseract 逻辑执行。

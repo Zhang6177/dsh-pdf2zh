@@ -9,6 +9,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      PDF2ZH_TESSDATA: ${{ github.workspace }}/.ocr-test-data
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,6 +31,7 @@ jobs:
           echo "PDF2ZH_CJK_FONT=$RUNNER_TEMP/NotoSansCJKsc-Regular.otf" >> "$GITHUB_ENV"
       - run: python -X utf8 -m pip install -r pipeline/requirements.txt
       - run: npm ci
+      - run: npm run setup:ocr
       - run: npm run typecheck
       - run: npm run build
       - name: Select Python

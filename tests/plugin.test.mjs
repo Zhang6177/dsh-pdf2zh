@@ -11,6 +11,8 @@ test('API protocol and error regression checks', () => {
   const python = process.env.PDF2ZH_PYTHON || (process.platform === 'win32' ? 'python' : 'python3')
   const result = spawnSync(python, ['-X', 'utf8', 'tests/translator.py'], { encoding: 'utf8' })
   assert.equal(result.status, 0, result.stderr)
+  const ocr = spawnSync(python, ['-X', 'utf8', 'tests/ocr.py'], { encoding: 'utf8' })
+  assert.equal(ocr.status, 0, ocr.stderr)
 })
 
 test('host API, real Python pipeline, recovery and credential safety', { timeout: 90000 }, async () => {

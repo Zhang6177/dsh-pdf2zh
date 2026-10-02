@@ -17,3 +17,4 @@ credentials*
 *.private.*
 test-results/
 pnpm-lock.yaml
+.ocr-test-data/

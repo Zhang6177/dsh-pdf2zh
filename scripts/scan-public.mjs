@@ -17,7 +17,7 @@ function check(label, data) {
 }
 function walk(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (['.git', 'node_modules', '.venv', 'data', '__pycache__'].includes(entry.name)) continue
+    if (['.git', 'node_modules', '.venv', 'data', '__pycache__', '.ocr-test-data'].includes(entry.name)) continue
     const path = join(dir, entry.name)
     if (entry.isDirectory()) walk(path)
     else if (!entry.name.endsWith('.tgz')) check(relative('.', path), readFileSync(path))

@@ -158,6 +158,20 @@ export PDF2ZH_MODEL='your-model-id'
 PDF2ZH_APPENDIX=1、PDF2ZH_GLOSSARY、PDF2ZH_FONT_SHRINK、PDF2ZH_REQ_TIMEOUT。
 模型仅接收正文段落，提取和排版由本地脚本完成；未配置 API 时明确报错。
 
+## 可选：扫描版 PDF 的 OCR
+
+普通文本 PDF 只需配置翻译 API。扫描版 PDF 可额外运行：
+
+```sh
+npm run setup:ocr
+```
+
+此命令下载 Tesseract 官方英文和简体中文识别数据（共约 7 MB），保存到 `DSH_HOME/ocr/tessdata`，未设置 DSH_HOME 时使用 `~/.dsh/ocr/tessdata`。识别复用 PyMuPDF 的集成 OCR，不添加新的 Python 包。识别在本机进行，翻译阶段才向配置的 API 发送文字。
+
+安装后扫描页自动先 OCR 再翻译；有文本层的页保持原流程。也可安装系统 Tesseract，或通过 `PDF2ZH_TESSDATA` 指向含 `eng.traineddata`、`chi_sim.traineddata` 的目录。网络不可用时可手动下载 [英文数据](https://github.com/tesseract-ocr/tessdata_fast/blob/main/eng.traineddata) 及 [中文数据](https://github.com/tesseract-ocr/tessdata_fast/blob/main/chi_sim.traineddata) 到该目录。环境变量需在启动 DSH 前设置。
+
+默认支持英文与简体中文 OCR；中文为主的材料会提示无需英转中。仅安装英文数据时只能可靠识别英文。模糊扫描、复杂公式和图表可能识别不准，必须核对输出；扫描页采用识别文字区域的白底覆盖，原文件不改动，未翻译区域保留扫描图像。图表边界保护取决于版式识别，不能保证所有扫描论文的图表都完整识别。没有图片的空白页跳过 OCR。
+
 ## 常见问题
 
 | 问题 | 处理 |

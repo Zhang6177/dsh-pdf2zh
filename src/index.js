@@ -38,7 +38,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { closeSync, createReadStream, openSync } from 'node:fs'
+import { closeSync, createReadStream, existsSync, openSync } from 'node:fs'
 import { copyFile, lstat, mkdir, readFile, readdir, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { createRequire } from 'node:module'
@@ -91,6 +91,14 @@ const VERSION = (() => {
 
 function dshHome() {
   return process.env.DSH_HOME || join(homedir(), '.dsh')
+}
+
+function ocrDataDir() {
+  return [process.env.PDF2ZH_TESSDATA, process.env.TESSDATA_PREFIX,
+    join(dshHome(), 'ocr', 'tessdata'), 'C:/Program Files/Tesseract-OCR/tessdata',
+    '/usr/share/tesseract-ocr/5/tessdata', '/usr/share/tesseract-ocr/4.00/tessdata',
+    '/opt/homebrew/share/tessdata', '/usr/local/share/tessdata']
+    .find(dir => dir && existsSync(join(dir, 'eng.traineddata'))) || ''
 }
 
 export const Config = z.object({
@@ -756,7 +764,11 @@ class Pdf2Zh {
     const outPath = m[1]
     let preview = ''
     try { preview = (await readFile(outPath, 'utf8')).slice(0, MAX_PREVIEW_CHARS) } catch { /* non-fatal */ }
-    return { outPath, pages: Number(m[2]), chars: Number(m[3]), preview }
+    const chars = Number(m[3])
+    if (chars === 0) preview = ocrDataDir()
+      ? '所选页面没有文本层。已安装OCR，点击开始翻译后将先在本机识别扫描页。'
+      : '所选页面没有文本层。请运行 npm run setup:ocr 安装OCR 数据，再开始翻译。'
+    return { outPath, pages: Number(m[2]), chars, preview }
   }
 
   /* ---------------- model catalog (dsh 的完整 API 注册表) ---------------- */
@@ -1076,6 +1088,10 @@ class Pdf2Zh {
     if (this.jobs.some((j) => j.status === 'running' && resolve(j.pdfPath) === resolve(pdfPath))) {
       throw new Error('该 PDF 已在翻译中，请等待完成，避免重复任务覆盖输出')
     }
+    const preview = await this.extract(pdfPath, input.pages)
+    if (preview.chars === 0 && !ocrDataDir()) {
+      throw new Error('所选页面没有文本层，需要 OCR。请运行 npm run setup:ocr 安装中英文识别数据，再开始翻译；直接重试或更换 API 无效。')
+    }
     const outputDir = await this.ensureOutputDir()
     const outDir = outputDir || dirname(pdfPath)
     const { selection, note } = await this.resolveModelSelection(input.model)
@@ -1157,6 +1173,7 @@ class Pdf2Zh {
           PDF2ZH_GLOSSARY: join(this.config.skillDir, 'glossary.md'),
           PDF2ZH_FONT_SHRINK: String(this.settings.fontShrink),
           PDF2ZH_LAYOUT: this.pipeline.layout ? 'gnn' : 'off',
+          PDF2ZH_TESSDATA: ocrDataDir(),
         },
       })
       await new Promise((ok, fail) => { child.once('spawn', ok); child.once('error', fail) })
@@ -1345,6 +1362,7 @@ class Pdf2Zh {
           python: this.pipeline.python,
           pymupdf: this.pymupdf,
           requests: this.requests,
+          ocr: { available: Boolean(ocrDataDir()), language: existsSync(join(ocrDataDir(), 'chi_sim.traineddata')) ? 'eng+chi_sim' : 'eng' },
           skill: this.skill,
           uploadDir: this.config.uploadDir,
           outputDir: this.settings.outputDir,

@@ -78,17 +78,19 @@ def main():
 
     lines = ["# source: %s" % os.path.basename(args.pdf),
              "# pages: %d" % len(pages), ""]
+    text_chars = 0
     for pno in pages:
         page = doc[pno - 1]
         texts = [b[4].strip() for b in sort_blocks(page, page.get_text("blocks"))]
         texts = [t for t in texts if t]
+        text_chars += sum(len(t) for t in texts)
         lines.append("\n[PAGE %d]\n" % pno)
         lines.append("\n\n".join(texts) + "\n")
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print("OK %s  pages=%d chars=%d" % (out_path, len(pages),
-                                        sum(len(l) for l in lines)))
+                                        text_chars))
 
 
 if __name__ == "__main__":

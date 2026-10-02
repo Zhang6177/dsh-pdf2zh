@@ -940,7 +940,7 @@ def _page_tables(page, blocks):
     return find_tables_fallback(page) + _ruled_tables(page)
 
 
-def extract_paper(path):
+def extract_paper(path, ocr_pages=None):
     doc = fitz.open(path)
     paper = Paper(path)
     math_fonts = _census_math_fonts(doc)
@@ -951,6 +951,9 @@ def extract_paper(path):
         raw = page.get_text("dict")
         W, H = page.rect.width, page.rect.height
         lay = layout_for_page(page)
+        is_ocr = pno in (ocr_pages or set())
+        if is_ocr and lay:
+            lay["picture"] = [r for r in lay["picture"] if r.get_area() < W * H * 0.8]
         formula_rects = lay["formula"] if lay else []
 
         if pno == 0:
@@ -1041,6 +1044,12 @@ def extract_paper(path):
             try:
                 pgd.protected = PROT.protected_regions(page, raw.get("blocks") or [],
                                                        table_rects)
+                if is_ocr:
+                    # The page-size raster is the scanned paper, not a figure.
+                    pgd.protected = [r for r in pgd.protected
+                                     if not (r[2] == "img" and r[0].get_area() >= W * H * 0.8)]
+                    if lay:
+                        pgd.protected += [(r, 0.55, "img") for r in lay["picture"]]
             except Exception:
                 pgd.protected = []
         ordered_dicts = _split_blocks_at_tables(ordered_dicts, table_rects, cap_rects)
