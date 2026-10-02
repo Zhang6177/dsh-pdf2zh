@@ -6,7 +6,6 @@ dsh-pdf2zh 插件（v0.8 快速管线）的配置全部来自环境变量，由�
 - PDF2ZH_API        'openai'（默认）| 'anthropic'
 - PDF2ZH_MODEL      模型 id
 - PDF2ZH_API_KEY    明文 key（可空 = 不带鉴权头）
-- PDF2ZH_CONCURRENCY 篇内并发请求数（默认 8）
 - PDF2ZH_GLOSSARY   术语表路径
 - PDF2ZH_TEMPERATURE 采样温度（默认 0.3）
 
@@ -17,7 +16,6 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -32,8 +30,6 @@ MAX_TOKENS = 16384
 RETRIES = 5                      # 服务端瞬时故障（如代理层 401 抖动）要能熬过去
 BACKOFF = (2, 5, 10, 20, 40)
 REQUEST_TIMEOUT = max(30, int(os.environ.get("PDF2ZH_REQ_TIMEOUT", "300")))
-# 篇内并发请求数；vLLM continuous batching 下并发≈吞吐线性扩展
-CONCURRENCY = max(1, int(os.environ.get("PDF2ZH_CONCURRENCY", "8")))
 SWEEP_BUDGET = max(30, int(os.environ.get("PDF2ZH_SWEEP_BUDGET", "420")))  # 补扫总时长上限
 
 SYSTEM_PROMPT = """你是学术论文英译中引擎。把用户给出的带编号英文段落逐段翻译成中文，严格遵守：
@@ -290,7 +286,7 @@ class Translator:
     def translate_paragraphs(self, paragraphs, progress_cb=None):
         """paragraphs: [Paragraph]。返回 {pid: 译文}。失败段落值为 None。
 
-        篇内并发：把段落切成分批（标题单独成批），用 CONCURRENCY 个线程并行翻译。
+        把段落切成分批（标题单独成批），按顺序调用配置的 API。
         """
         units = []          # 每个 unit = 一个翻译批次 [Paragraph, ...]
         batch = []
@@ -330,12 +326,8 @@ class Translator:
             if progress_cb:
                 progress_cb(done, total)
 
-        if CONCURRENCY <= 1 or len(units) <= 1:
-            for u in units:
-                work(u)
-        else:
-            with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
-                list(ex.map(work, units))
+        for unit in units:
+            work(unit)
 
         # 二次补扫：把瞬时故障（网关 401 抖动等）导致失败的批次再串行轻补一遍。
         # 单 attempt 直调 + 全局时间预算，避免个别挂死批次把整篇拖爆。

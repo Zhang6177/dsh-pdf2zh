@@ -9,7 +9,7 @@
 
 - 拖拽上传或填写文件绝对路径，支持中文与空格路径；提取预览与页码选择。
 - OpenAI Chat Completions / Anthropic Messages 兼容 API，设置面板配置地址、密钥、模型。
-- 并发段落翻译、术语表编辑、进度看板、下载、失败重试、超时终止。
+- 顺序段落翻译、术语表编辑、进度看板、下载、失败重试、超时终止。
 - 保留页面尺寸，尽量保护图像、表格和独立公式，中文正文按列排版。
 - 行内公式使用 Unicode 文本与上下标；空间不足的段落保留英文并记录警告。
 - 可选附录和中英对照 Markdown；后台管线可在 DSH 重启后继续被跟踪。
@@ -116,8 +116,8 @@ Anthropic 使用 `/v1/messages`。特殊网关请按服务文档配置完整根�
 3. 按需填页码，如 1-3、1,3,5-8，勾选中英对照或附录，点击开始翻译。
 4. 在看板查看进度和下载结果；失败后修正配置再重试。
 
-设置中可调输出目录、并发（1–16）、字号收缩（0–3pt）和超时。
-并发建议从 2/4 开始，按服务限流调整。源文件目录不可写时请设置可写输出目录。
+设置中可调输出目录、字号收缩（0–3pt）和超时。
+翻译按顺序调用配置的 API，无需设置并发。源文件目录不可写时请设置可写输出目录。
 同一 PDF 进行中不能重复启动。默认翻译到参考文献前；附录选项识别常见 Appendix/Supplementary 标题，参考文献不翻译。
 
 ## 数据与配置
@@ -154,7 +154,7 @@ export PDF2ZH_MODEL='your-model-id'
 /path/to/venv/bin/python -X utf8 pipeline/run_pipeline.py
 ```
 
-可选变量：PDF2ZH_API=openai|anthropic、PDF2ZH_CONCURRENCY、PDF2ZH_PAGES、PDF2ZH_BILINGUAL=1、
+可选变量：PDF2ZH_API=openai|anthropic、PDF2ZH_PAGES、PDF2ZH_BILINGUAL=1、
 PDF2ZH_APPENDIX=1、PDF2ZH_GLOSSARY、PDF2ZH_FONT_SHRINK、PDF2ZH_REQ_TIMEOUT。
 模型仅接收正文段落，提取和排版由本地脚本完成；未配置 API 时明确报错。
 
@@ -166,7 +166,7 @@ PDF2ZH_APPENDIX=1、PDF2ZH_GLOSSARY、PDF2ZH_FONT_SHRINK、PDF2ZH_REQ_TIMEOUT。
 | API 不可达 | 核对地址、网络、防火墙、服务状态；本地 DSH 的 127.0.0.1 指本机，不能代表远程服务器 |
 | 401/403 | 修正密钥与权限后重试；不会持续重试鉴权错误 |
 | 400/404/422 | 核对协议、根路径和模型 ID；服务若不接受 chat_template_kwargs，可使用兼容网关 |
-| 429/5xx/超时 | 降低并发并检查限流；临时错误有限重试，超过任务超时会终止 |
+| 429/5xx/超时 | 检查 API 限流；临时错误有限重试，超过任务超时会终止 |
 | 缺字体 | 安装 Noto Sans CJK 或设置 PDF2ZH_CJK_FONT |
 | 扫描版/中文 PDF | 扫描版先 OCR，中文为主的文档无需英译中 |
 | 残留英文/排版警告 | 检查图表、公式、参考文献或空间不足区域；适当增大字号收缩量，并复核可读性 |

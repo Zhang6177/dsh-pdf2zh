@@ -14,7 +14,7 @@
  *       POST /extract       — run the PyMuPDF extractor on a server-side PDF path
  *       POST /translate     — spawn the structured fast pipeline (detached python), record a job
  *       POST /upload        — drag-drop PDF upload (raw body, filename in x-pdf2zh-filename)
- *       GET  /settings      — current UI settings (output dir / timeout / model / concurrency)
+ *       GET  /settings      — current UI settings (output dir / timeout / model)
  *       POST /settings      — persist UI settings (~/.dsh/pdf2zh/settings.json)
  *       GET  /models        — the dsh LLM registry (providers/models + auto pick)
  *       POST /models/discover — probe an endpoint's model list (draft key, never stored)
@@ -32,7 +32,7 @@
  * v0.8: translation is no longer done inside a DSH session. The host spawns
  * `pipeline/run_pipeline.py` (PyMuPDF layout extraction → batched paragraph
  * translation against the selected OpenAI/Anthropic-compatible endpoint with
- * thinking disabled and N-way concurrency → layout-faithful Chinese PDF).
+ * sequential API translation → layout-faithful Chinese PDF).
  * Deterministic work stays deterministic; the LLM only translates text.
  */
 
@@ -69,8 +69,6 @@ const PIPELINE_START_GRACE_MS = 120_000
 const PIPELINE_STALE_MS = 60_000
 const DEFAULT_TIMEOUT_MINUTES = 240
 const MAX_TIMEOUT_MINUTES = 1440
-const DEFAULT_CONCURRENCY = 8
-const MAX_CONCURRENCY = 16
 const DEFAULT_FONT_SHRINK = 1.5
 const MAX_JOBS = 200
 /** dsh settings namespace owning LLM provider profiles (the Models settings page writes it too). */
@@ -134,7 +132,6 @@ class Pdf2Zh {
       fontShrink: clampFontShrink(config.fontShrink),
       python: this.config.python,
       model: { provider: '', model: '' },
-      concurrency: DEFAULT_CONCURRENCY,
     }
     this.jobs = []
     this.children = new Map()
@@ -380,9 +377,6 @@ class Pdf2Zh {
       if (typeof raw.timeoutMinutes === 'number') {
         this.settings.timeoutMinutes = clampTimeout(raw.timeoutMinutes)
       }
-      if (typeof raw.concurrency === 'number') {
-        this.settings.concurrency = clampConcurrency(raw.concurrency)
-      }
       if (typeof raw.fontShrink === 'number') {
         this.settings.fontShrink = clampFontShrink(raw.fontShrink)
       }
@@ -401,7 +395,6 @@ class Pdf2Zh {
       outputDir: this.settings.outputDir,
       timeoutMinutes: this.settings.timeoutMinutes,
       model: this.settings.model,
-      concurrency: this.settings.concurrency,
       fontShrink: this.settings.fontShrink,
       python: this.settings.python,
     }, null, 2), { mode: 0o644 })
@@ -427,9 +420,6 @@ class Pdf2Zh {
     }
     if (patch.timeoutMinutes !== undefined) {
       next.timeoutMinutes = clampTimeout(patch.timeoutMinutes)
-    }
-    if (patch.concurrency !== undefined) {
-      next.concurrency = clampConcurrency(patch.concurrency)
     }
     if (patch.fontShrink !== undefined) {
       next.fontShrink = clampFontShrink(patch.fontShrink)
@@ -1164,7 +1154,6 @@ class Pdf2Zh {
           PDF2ZH_API: profile.api === 'anthropic-messages' ? 'anthropic' : 'openai',
           PDF2ZH_MODEL: job.model,
           PDF2ZH_API_KEY: await this.resolveApiKey(profile.apiKeyEnv),
-          PDF2ZH_CONCURRENCY: String(this.settings.concurrency),
           PDF2ZH_GLOSSARY: join(this.config.skillDir, 'glossary.md'),
           PDF2ZH_FONT_SHRINK: String(this.settings.fontShrink),
           PDF2ZH_LAYOUT: this.pipeline.layout ? 'gnn' : 'off',
@@ -1360,7 +1349,6 @@ class Pdf2Zh {
           uploadDir: this.config.uploadDir,
           outputDir: this.settings.outputDir,
           timeoutMinutes: this.settings.timeoutMinutes,
-          concurrency: this.settings.concurrency,
           fontShrink: this.settings.fontShrink,
           pipelineDir: PIPELINE_DIR,
           dataDir: this.dataDir,
@@ -1540,12 +1528,6 @@ function clampTimeout(value) {
   const n = Math.round(Number(value))
   if (!Number.isFinite(n)) return DEFAULT_TIMEOUT_MINUTES
   return Math.min(MAX_TIMEOUT_MINUTES, Math.max(10, n))
-}
-
-function clampConcurrency(value) {
-  const n = Math.round(Number(value))
-  if (!Number.isFinite(n)) return DEFAULT_CONCURRENCY
-  return Math.min(MAX_CONCURRENCY, Math.max(1, n))
 }
 
 function clampFontShrink(value) {

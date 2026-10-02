@@ -1,7 +1,7 @@
 {
   "name": "dsh-pdf2zh",
-  "version": "0.13.1",
-  "description": "学术论文 PDF 英转中 dsh 插件：图/表整区零改动（不翻译不重排）、按列几何自适应排版（行距绑定字号，杜绝压字与越界）、并发翻译 + 排版保真中文 PDF；带翻译看板（进度条 + 失败重试）、API 连通性探活与设置弹窗。",
+  "version": "0.13.2",
+  "description": "学术论文 PDF 英转中 dsh 插件：图/表整区零改动（不翻译不重排）、按列几何自适应排版（行距绑定字号，杜绝压字与越界）、顺序翻译 + 排版保真中文 PDF；带翻译看板（进度条 + 失败重试）、API 连通性探活与设置弹窗。",
   "author": "dsh-pdf2zh contributors",
   "type": "module",
   "main": "./src/index.js",

@@ -13,7 +13,7 @@
  *
  * The header "⚙ 设置" button opens a tabbed settings modal: 模型 API (all
  * providers/models from the dsh LLM registry, click to set the translation
- * default, auto = prefer local) and 输出与性能 (save dir, pipeline concurrency, timeout).
+ * default, auto = prefer local) and 输出与性能 (save dir, timeout).
  *
  * Failure policy mirrors the reference plugins: DOM mounting problems are
  * logged, never thrown — a throwing client apply fails the whole web boot.
@@ -52,7 +52,6 @@ interface Health {
   skill: { dir: string; synced: boolean; files: string[] }
   runtime?: { python: string; layout: boolean }
   fontShrink?: number
-  concurrency?: number
 }
 
 interface ExtractResult {
@@ -120,7 +119,6 @@ interface Settings {
   outputDir: string
   timeoutMinutes: number
   model: ModelSelection
-  concurrency?: number
   fontShrink?: number
 }
 
@@ -202,7 +200,6 @@ const api = {
     outputDir?: string
     timeoutMinutes?: number
     model?: ModelSelection
-    concurrency?: number
     fontShrink?: number
     python?: string
   }): Promise<Settings> => call<Settings>(`${API_PREFIX}/settings`, 'POST', body),
@@ -600,7 +597,6 @@ const TIMEOUT_PRESETS = [
   { v: 720, label: '12 小时' },
 ]
 
-const CONCURRENCY_PRESETS = [2, 4, 8, 12]
 const FONT_SHRINK_PRESETS = [0.5, 1, 1.5, 2, 2.5]
 
 function SettingsModal({ settings, onClose, onSaved }: {
@@ -614,7 +610,6 @@ function SettingsModal({ settings, onClose, onSaved }: {
   const [savingModel, setSavingModel] = useState('')
   const [outputDir, setOutputDir] = useState(settings?.outputDir ?? '')
   const [timeoutMinutes, setTimeoutMinutes] = useState(String(settings?.timeoutMinutes ?? 240))
-  const [concurrency, setConcurrency] = useState(String(settings?.concurrency ?? 8))
   const [fontShrink, setFontShrink] = useState(String(settings?.fontShrink ?? 1.5))
   const [python, setPython] = useState(settings?.python ?? '')
   const [recentDirs, setRecentDirs] = useState<string[]>(() => readRecentList(RECENT_DIR_KEY, RECENT_DIR_MAX))
@@ -628,7 +623,6 @@ function SettingsModal({ settings, onClose, onSaved }: {
     if (settings !== null) {
       setOutputDir(settings.outputDir)
       setTimeoutMinutes(String(settings.timeoutMinutes))
-      setConcurrency(String(settings.concurrency ?? 8))
       setFontShrink(String(settings.fontShrink ?? 1.5))
       setPython(settings.python ?? '')
     }
@@ -669,21 +663,20 @@ function SettingsModal({ settings, onClose, onSaved }: {
       const next = await api.settingsSave({
         outputDir: outputDir.trim(),
         timeoutMinutes: Number(timeoutMinutes) || undefined,
-        concurrency: Number(concurrency) || undefined,
         fontShrink: Number(fontShrink),
         python,
       })
       onSaved(next)
       if (next.outputDir !== '') setRecentDirs(pushRecentDir(next.outputDir))
       setNotice(next.outputDir
-        ? `已保存：译文保存到 ${next.outputDir}（并发 ${next.concurrency ?? 8}，字号收缩 ${next.fontShrink ?? 1.5}pt）`
-        : `已保存：译文保存在源 PDF 同目录（并发 ${next.concurrency ?? 8}，字号收缩 ${next.fontShrink ?? 1.5}pt）`)
+        ? `已保存：译文保存到 ${next.outputDir}（字号收缩 ${next.fontShrink ?? 1.5}pt）`
+        : `已保存：译文保存在源 PDF 同目录（字号收缩 ${next.fontShrink ?? 1.5}pt）`)
     } catch (err: any) {
       setError(err?.message ?? String(err))
     } finally {
       setSavingForm(false)
     }
-  }, [outputDir, timeoutMinutes, concurrency, fontShrink, python, onSaved])
+  }, [outputDir, timeoutMinutes, fontShrink, python, onSaved])
 
   /** Form success: refresh catalog, optionally set the new provider as default. */
   const onProviderAdded = useCallback(async (r: AddModelProfileResult, wantDefault: boolean): Promise<void> => {
@@ -886,30 +879,6 @@ function SettingsModal({ settings, onClose, onSaved }: {
                 e('div', { className: 'pdf2zh-field-label' }, 'Python 环境'),
                 e('input', { className: 'pdf2zh-input pdf2zh-input-mono', style: INPUT_STYLE, value: python, placeholder: '留空自动检测；也可填写 python.exe 或 bin/python 的完整路径', onChange: (ev: any) => setPython(ev.target.value), spellCheck: false }),
                 e('div', { className: 'pdf2zh-field-hint' }, '先按 README 安装 Python 依赖。保存时立即检查并生效，无需重启。'),
-              ),
-              e('div', { className: 'pdf2zh-field-card' },
-                e('div', { className: 'pdf2zh-field-label' }, e('span', { className: 'pdf2zh-field-icon' }, svg(ICONS.translate, 14)), '翻译并发'),
-                e('div', { className: 'pdf2zh-preset-row' },
-                  CONCURRENCY_PRESETS.map((c) => e('button', {
-                    key: c,
-                    type: 'button',
-                    className: `pdf2zh-preset${String(c) === concurrency ? ' pdf2zh-preset-on' : ''}`,
-                    onClick: () => setConcurrency(String(c)),
-                  }, `${c} 路`)),
-                  e('span', { className: 'pdf2zh-preset-custom' },
-                    e('input', {
-                      className: 'pdf2zh-input pdf2zh-preset-input',
-                      style: { ...INPUT_STYLE, padding: '6px 10px', fontSize: 13 },
-                      value: concurrency,
-                      type: 'number',
-                      min: 1,
-                      max: 16,
-                      onChange: (ev: any) => setConcurrency(ev.target.value),
-                    }),
-                    e('span', { className: 'pdf2zh-preset-unit' }, '并发'),
-                  ),
-                ),
-                e('div', { className: 'pdf2zh-field-hint' }, '1–16。同时向模型服务发出的翻译请求数；本地 vLLM 建议 8。数值过高会挤占同一 GPU 上其它会话的吞吐。'),
               ),
               e('div', { className: 'pdf2zh-field-card' },
                 e('div', { className: 'pdf2zh-field-label' }, e('span', { className: 'pdf2zh-field-icon' }, svg(ICONS.doc, 14)), '正文字号收缩'),

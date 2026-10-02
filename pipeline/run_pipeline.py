@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dsh-pdf2zh 快速翻译管线（v0.8）：提取 → 分段并发翻译（关思考） → 排版保真渲染。
+"""dsh-pdf2zh 快速翻译管线（v0.8）：提取 → 分段顺序翻译（关思考） → 排版保真渲染。
 
 由插件宿主以 `detached` 子进程方式启动（脱离宿主会话组，宿主重启不影响在途任务）。
 全部参数走环境变量；进度与结果写入 PDF2ZH_PROGRESS_PATH 指向的 JSON 文件
@@ -13,7 +13,6 @@
 可选 env：
   PDF2ZH_PAGES          页码规格 "1-8" / "1,3"
   PDF2ZH_BILINGUAL      "1" 时额外产出 <stem>.en-zh.md
-  PDF2ZH_CONCURRENCY    篇内并发请求数（默认 8）
   PDF2ZH_GLOSSARY / PDF2ZH_TEMPERATURE / PDF2ZH_CJK_FONT
 """
 import json
@@ -210,7 +209,7 @@ def main():
 
         paras = paper.translatable_paragraphs()
         tr = T.Translator()
-        print("engine: %s conc=%d" % (tr.api, T.CONCURRENCY), flush=True)
+        print("engine: %s" % tr.api, flush=True)
         if not tr.health():
             raise RuntimeError("模型端点不可用（%s）。请在设置中更换 API 或启动模型服务后重试" % tr.url)
 
