@@ -22,6 +22,11 @@ jobs:
           python-version: '3.11'
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
+      - name: Install CJK font on macOS
+        if: runner.os == 'macOS'
+        run: |
+          curl --fail --location --retry 3 https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf -o "$RUNNER_TEMP/NotoSansCJKsc-Regular.otf"
+          echo "PDF2ZH_CJK_FONT=$RUNNER_TEMP/NotoSansCJKsc-Regular.otf" >> "$GITHUB_ENV"
       - run: python -X utf8 -m pip install -r pipeline/requirements.txt
       - run: npm ci
       - run: npm run typecheck
